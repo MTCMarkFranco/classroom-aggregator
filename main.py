@@ -100,9 +100,8 @@ def display_classes(
         )
         table.add_column("Class", style="bold white")
         table.add_column("Code", style="cyan")
-        table.add_column("Teacher", style="dim")
         for cls in gc_classes:
-            table.add_row(cls.name, cls.short_code, cls.teacher or "-")
+            table.add_row(cls.name, cls.short_code)
         console.print(table)
     else:
         console.print("[yellow]No classes found on Google Classroom[/yellow]")
@@ -119,9 +118,8 @@ def display_classes(
         )
         table.add_column("Class", style="bold white")
         table.add_column("Code", style="cyan")
-        table.add_column("Teacher", style="dim")
         for cls in bs_classes:
-            table.add_row(cls.name, cls.short_code, cls.teacher or "-")
+            table.add_row(cls.name, cls.short_code)
         console.print(table)
     else:
         console.print("[yellow]No classes found on Brightspace[/yellow]")
