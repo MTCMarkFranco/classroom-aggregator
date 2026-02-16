@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Debug screenshots
+debug_screenshots/
+
+# Playwright
+playwright-report/
+test-results/
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Secrets / credentials
+*.env
+.env
