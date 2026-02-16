@@ -20,20 +20,23 @@ from models import (
 
 logger = logging.getLogger(__name__)
 
-SEMESTER_CLASSES = ["ENG", "GLE", "PPL", "History"]
+# Default semester classes (overridden by .env / constructor arg)
+DEFAULT_SEMESTER_CLASSES = ["ENG", "GLE", "PPL", "History"]
 
 
-def _matches_semester_class(class_name: str) -> bool:
+def _matches_semester_class(class_name: str, semester_classes: list[str] | None = None) -> bool:
+    classes = semester_classes or DEFAULT_SEMESTER_CLASSES
     name_upper = class_name.upper()
-    for code in SEMESTER_CLASSES:
+    for code in classes:
         if code.upper() in name_upper:
             return True
     return False
 
 
-def _get_short_code(class_name: str) -> str:
+def _get_short_code(class_name: str, semester_classes: list[str] | None = None) -> str:
+    classes = semester_classes or DEFAULT_SEMESTER_CLASSES
     name_upper = class_name.upper()
-    for code in SEMESTER_CLASSES:
+    for code in classes:
         if code.upper() in name_upper:
             return code.upper()
     return class_name[:10]
@@ -44,7 +47,8 @@ class BrightspaceScraper:
 
     BASE_URL = "https://tdsb.elearningontario.ca"
 
-    def __init__(self, context: BrowserContext):
+    def __init__(self, context: BrowserContext, semester_classes: list[str] | None = None):
+        self.semester_classes = semester_classes or DEFAULT_SEMESTER_CLASSES
         self.context = context
         self.classes: list[ClassInfo] = []
         self.assignments: list[Assignment] = []
@@ -81,7 +85,7 @@ class BrightspaceScraper:
         logger.info("Found %d total classes on Brightspace", len(all_classes))
 
         # Filter to semester classes
-        self.classes = [c for c in all_classes if _matches_semester_class(c.name)]
+        self.classes = [c for c in all_classes if _matches_semester_class(c.name, self.semester_classes)]
         logger.info("Matched %d semester classes on Brightspace", len(self.classes))
 
         if not self.classes:
@@ -163,7 +167,7 @@ class BrightspaceScraper:
                         name=text.split("\n")[0].strip(),
                         platform=Platform.BRIGHTSPACE,
                         url=full_url,
-                        short_code=_get_short_code(text),
+                        short_code=_get_short_code(text, self.semester_classes),
                     ))
                 except Exception:
                     continue
@@ -209,7 +213,7 @@ class BrightspaceScraper:
                             name=name,
                             platform=Platform.BRIGHTSPACE,
                             url=f"{self.BASE_URL}/d2l/home/{org_id}",
-                            short_code=_get_short_code(name),
+                            short_code=_get_short_code(name, self.semester_classes),
                         ))
         except Exception as e:
             logger.debug("D2L API enrollment fetch: %s", e)
@@ -238,7 +242,7 @@ class BrightspaceScraper:
                             name=text.split("\n")[0].strip(),
                             platform=Platform.BRIGHTSPACE,
                             url=full_url,
-                            short_code=_get_short_code(text),
+                            short_code=_get_short_code(text, self.semester_classes),
                         ))
                 except Exception:
                     continue

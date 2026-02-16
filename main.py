@@ -13,9 +13,14 @@ import asyncio
 import argparse
 import getpass
 import logging
+import os
 import sys
 from datetime import datetime
 from collections import defaultdict
+
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from rich.console import Console
 from rich.table import Table
@@ -44,7 +49,7 @@ SEMESTER_CLASSES = {
 
 
 def setup_logging(debug: bool = False):
-    level = logging.DEBUG if debug else logging.INFO
+    level = logging.DEBUG if debug else logging.WARNING
     logging.basicConfig(
         level=level,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -284,7 +289,13 @@ def display_summary(all_assignments: list[Assignment]):
     console.print()
 
 
-async def run(username: str, password: str, headless: bool = False, debug: bool = False):
+async def run(
+    username: str,
+    password: str,
+    headless: bool = False,
+    debug: bool = False,
+    semester_classes: list[str] | None = None,
+):
     """Main async workflow."""
     auth = TDSBAuth(username, password, debug=debug)
 
@@ -307,7 +318,7 @@ async def run(username: str, password: str, headless: bool = False, debug: bool 
             console.print("[green]✓ Google Classroom login successful[/green]")
 
             with console.status("[bold green]Scraping Google Classroom...[/bold green]"):
-                gc_scraper = GoogleClassroomScraper(gc_context)
+                gc_scraper = GoogleClassroomScraper(gc_context, semester_classes=semester_classes)
                 gc_classes, gc_assignments = await gc_scraper.scrape_all()
 
                 # Also try the global to-do
@@ -341,7 +352,7 @@ async def run(username: str, password: str, headless: bool = False, debug: bool 
             console.print("[blue]✓ Brightspace login successful[/blue]")
 
             with console.status("[bold blue]Scraping Brightspace...[/bold blue]"):
-                bs_scraper = BrightspaceScraper(bs_context)
+                bs_scraper = BrightspaceScraper(bs_context, semester_classes=semester_classes)
                 bs_classes, bs_assignments = await bs_scraper.scrape_all()
 
             all_assignments.extend(bs_assignments)
@@ -402,22 +413,37 @@ def main():
 
     setup_logging(debug=args.debug)
 
-    # Get credentials
-    if args.username and args.password:
-        username = args.username
-        password = args.password
-    elif args.username:
-        username = args.username
-        password = getpass.getpass("TDSB Password: ")
-    else:
-        username, password = get_credentials()
+    # Get credentials: CLI args > .env > interactive prompt
+    username = args.username or os.getenv("TDSB_USERNAME") or ""
+    password = args.password or os.getenv("TDSB_PASSWORD") or ""
+
+    if not username or not password:
+        if username:
+            password = getpass.getpass("TDSB Password: ")
+        else:
+            username, password = get_credentials()
 
     if not username or not password:
         console.print("[red]Username and password are required.[/red]")
         sys.exit(1)
 
+    # Semester classes from .env (comma-separated) or default
+    semester_env = os.getenv("SEMESTER_CLASSES", "")
+    semester_classes = (
+        [s.strip() for s in semester_env.split(",") if s.strip()]
+        if semester_env
+        else ["ENG", "GLE", "PPL", "History"]
+    )
+
+    # Headless mode: CLI flag overrides .env
+    headless = args.headless or os.getenv("HEADLESS", "false").lower() in ("true", "1", "yes")
+
     # Run the aggregator
-    asyncio.run(run(username, password, headless=args.headless, debug=args.debug))
+    asyncio.run(run(
+        username, password,
+        headless=headless, debug=args.debug,
+        semester_classes=semester_classes,
+    ))
 
 
 if __name__ == "__main__":
