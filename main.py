@@ -1,447 +1,356 @@
+#!/usr/bin/env python3
 """
-Classroom Assignment Aggregator - Main Application
+Classroom Aggregator – Main Entry Point
 
-Aggregates incomplete assignments from Google Classroom and Brightspace
-for TDSB students. Uses browser automation for SSO login since
-API/app registration is not available.
-
-Usage:
-    python main.py [--headless] [--debug]
+Aggregates incomplete assignments from Google Classroom and D2L Brightspace
+for a TDSB student account, displaying a clean Rich-formatted summary.
 """
 
-import asyncio
 import argparse
-import getpass
 import logging
 import os
 import sys
 from datetime import datetime
-from collections import defaultdict
 
 from dotenv import load_dotenv
-
-load_dotenv()
-
 from rich.console import Console
-from rich.table import Table
 from rich.panel import Panel
+from rich.table import Table
 from rich.text import Text
-from rich.columns import Columns
-from rich.rule import Rule
-from rich import box
 
-from models import (
-    ClassInfo, Assignment, Platform, AssignmentStatus, ItemType
-)
 from auth import TDSBAuth
+from models import Platform, AssignmentStatus, ItemType, Assignment
 from google_classroom_scraper import GoogleClassroomScraper
 from brightspace_scraper import BrightspaceScraper
 
+logger = logging.getLogger(__name__)
+
+# ─── Constants ──────────────────────────────────────────────────────────
+
 console = Console()
 
-# Semester classes to look for
-SEMESTER_CLASSES = {
-    "ENG": "English",
-    "GLE": "GLE",
-    "PPL": "PPL (Gym)",
-    "HISTORY": "History",
+STATUS_COLORS = {
+    AssignmentStatus.MISSING: "bold red",
+    AssignmentStatus.LATE: "red",
+    AssignmentStatus.NOT_SUBMITTED: "yellow",
+    AssignmentStatus.ASSIGNED: "cyan",
+    AssignmentStatus.UPCOMING: "blue",
+    AssignmentStatus.UNKNOWN: "dim",
+}
+
+PLATFORM_COLORS = {
+    Platform.GOOGLE_CLASSROOM: "green",
+    Platform.BRIGHTSPACE: "blue",
+}
+
+TYPE_ICONS = {
+    ItemType.ASSIGNMENT: "[bold]A[/bold]",
+    ItemType.QUIZ: "[bold magenta]Q[/bold magenta]",
+    ItemType.ANNOUNCEMENT: "[dim]N[/dim]",
+    ItemType.MATERIAL: "[dim]M[/dim]",
+    ItemType.DISCUSSION: "[bold cyan]D[/bold cyan]",
+    ItemType.EVENT: "[bold blue]E[/bold blue]",
 }
 
 
-def setup_logging(debug: bool = False):
-    level = logging.DEBUG if debug else logging.WARNING
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        datefmt="%H:%M:%S",
+# ─── Display helpers ────────────────────────────────────────────────────
+
+def display_classes(classes, platform_name: str):
+    """Show a table of discovered classes for *platform_name*."""
+    if not classes:
+        console.print(f"  [dim]No classes found on {platform_name}.[/dim]")
+        return
+
+    table = Table(
+        title=f"{platform_name} Classes",
+        show_header=True,
+        header_style="bold",
+        padding=(0, 1),
     )
-    # Suppress noisy loggers unless in debug mode
-    if not debug:
-        logging.getLogger("urllib3").setLevel(logging.WARNING)
-        logging.getLogger("asyncio").setLevel(logging.WARNING)
+    table.add_column("#", style="dim", width=3)
+    table.add_column("Class", min_width=20)
+    table.add_column("Code", width=10)
 
+    for i, cls in enumerate(classes, 1):
+        table.add_row(str(i), cls.name, cls.short_code)
 
-def get_credentials() -> tuple[str, str]:
-    """Prompt user for TDSB credentials."""
+    console.print(table)
     console.print()
-    console.print(
-        Panel(
-            "[bold cyan]TDSB Classroom Assignment Aggregator[/bold cyan]\n\n"
-            "This tool scrapes Google Classroom and Brightspace for\n"
-            "incomplete assignments using browser automation.\n\n"
-            "[dim]Your credentials are used only for login and are not stored.[/dim]",
-            title="Welcome",
-            border_style="cyan",
-        )
+
+
+def display_assignments(assignments: list[Assignment], title: str = "Assignments"):
+    """Show a Rich table of assignment items."""
+    if not assignments:
+        console.print(f"  [dim]No items to display for {title}.[/dim]")
+        return
+
+    table = Table(
+        title=title,
+        show_header=True,
+        header_style="bold",
+        padding=(0, 1),
     )
-    console.print()
+    table.add_column("Type", width=4, justify="center")
+    table.add_column("Course", min_width=10)
+    table.add_column("Title", min_width=20)
+    table.add_column("Status", min_width=10)
+    table.add_column("Due", min_width=15)
+    table.add_column("Platform", width=12)
 
-    username = console.input("[bold yellow]TDSB Username[/bold yellow] (e.g. 123456789@tdsb.ca): ")
-    password = getpass.getpass("TDSB Password: ")
-    return username.strip(), password.strip()
+    for a in assignments:
+        icon = TYPE_ICONS.get(a.item_type, "")
+        status_style = STATUS_COLORS.get(a.status, "")
 
+        due_text = a.display_due
+        if a.is_overdue:
+            due_text = f"[bold red]{due_text} (OVERDUE)[/bold red]"
 
-def display_classes(
-    gc_classes: list[ClassInfo],
-    bs_classes: list[ClassInfo],
-):
-    """Display discovered classes."""
-    console.print()
-    console.print(Rule("[bold cyan]Discovered Classes[/bold cyan]"))
-    console.print()
+        platform_style = PLATFORM_COLORS.get(a.platform, "")
 
-    # Google Classroom classes
-    if gc_classes:
-        table = Table(
-            title="Google Classroom",
-            box=box.ROUNDED,
-            title_style="bold green",
-            show_lines=True,
+        table.add_row(
+            icon,
+            a.course_name or "—",
+            a.title,
+            f"[{status_style}]{a.status.value}[/{status_style}]" if status_style else a.status.value,
+            due_text,
+            f"[{platform_style}]{a.platform.value}[/{platform_style}]" if platform_style else a.platform.value,
         )
-        table.add_column("Class", style="bold white")
-        table.add_column("Code", style="cyan")
-        for cls in gc_classes:
-            table.add_row(cls.name, cls.short_code)
-        console.print(table)
-    else:
-        console.print("[yellow]No classes found on Google Classroom[/yellow]")
 
+    console.print(table)
     console.print()
 
-    # Brightspace classes
-    if bs_classes:
-        table = Table(
-            title="Brightspace",
-            box=box.ROUNDED,
-            title_style="bold blue",
-            show_lines=True,
-        )
-        table.add_column("Class", style="bold white")
-        table.add_column("Code", style="cyan")
-        for cls in bs_classes:
-            table.add_row(cls.name, cls.short_code)
-        console.print(table)
-    else:
-        console.print("[yellow]No classes found on Brightspace[/yellow]")
 
-
-def display_assignments(all_assignments: list[Assignment]):
-    """Display all incomplete assignments in a formatted table."""
-    console.print()
-    console.print(Rule("[bold red]Incomplete Assignments & Work To Do[/bold red]"))
-    console.print()
-
-    if not all_assignments:
+def display_summary(all_assignments: list[Assignment]):
+    """Show a summary panel with counts by status and platform."""
+    total = len(all_assignments)
+    if total == 0:
         console.print(
             Panel(
-                "[bold green]No incomplete assignments found! All caught up! 🎉[/bold green]",
+                "[green bold]All clear! No outstanding assignments found.[/green bold]",
+                title="Summary",
                 border_style="green",
             )
         )
         return
 
-    # Group by course
-    by_course: dict[str, list[Assignment]] = defaultdict(list)
+    by_status: dict[AssignmentStatus, int] = {}
+    by_platform: dict[Platform, int] = {}
+    overdue_count = 0
+
     for a in all_assignments:
-        key = a.course_name or "General / Unknown"
-        by_course[key].append(a)
+        by_status[a.status] = by_status.get(a.status, 0) + 1
+        by_platform[a.platform] = by_platform.get(a.platform, 0) + 1
+        if a.is_overdue:
+            overdue_count += 1
 
-    # Sort courses
-    for course_name in sorted(by_course.keys()):
-        assignments = by_course[course_name]
+    lines = [f"[bold]Total items:[/bold] {total}"]
+    if overdue_count:
+        lines.append(f"[bold red]Overdue:[/bold red] {overdue_count}")
 
-        # Sort within course: overdue first, then by due date
-        assignments.sort(key=lambda a: (
-            0 if a.status == AssignmentStatus.MISSING else
-            1 if a.is_overdue else
-            2 if a.due_date else 3,
-            a.due_date or datetime.max,
-        ))
+    lines.append("")
+    lines.append("[bold]By status:[/bold]")
+    for status, count in sorted(by_status.items(), key=lambda x: x[1], reverse=True):
+        style = STATUS_COLORS.get(status, "")
+        label = f"[{style}]{status.value}[/{style}]" if style else status.value
+        lines.append(f"  {label}: {count}")
 
-        # Create table for this course
-        table = Table(
-            title=f"📚 {course_name}",
-            box=box.ROUNDED,
-            title_style="bold white",
-            show_lines=True,
-            padding=(0, 1),
-        )
-        table.add_column("#", style="dim", width=3)
-        table.add_column("Type", style="cyan", width=12)
-        table.add_column("Title", style="bold white", max_width=50)
-        table.add_column("Status", width=15)
-        table.add_column("Due Date", width=22)
-        table.add_column("Platform", style="dim", width=18)
+    lines.append("")
+    lines.append("[bold]By platform:[/bold]")
+    for platform, count in sorted(by_platform.items(), key=lambda x: x[1], reverse=True):
+        style = PLATFORM_COLORS.get(platform, "")
+        label = f"[{style}]{platform.value}[/{style}]" if style else platform.value
+        lines.append(f"  {label}: {count}")
 
-        for i, a in enumerate(assignments, 1):
-            # Status styling
-            if a.status == AssignmentStatus.MISSING:
-                status_text = Text("⚠ MISSING", style="bold red")
-            elif a.is_overdue:
-                status_text = Text("⏰ OVERDUE", style="bold red")
-            elif a.status == AssignmentStatus.LATE:
-                status_text = Text("⚠ LATE", style="bold yellow")
-            elif a.status == AssignmentStatus.NOT_SUBMITTED:
-                status_text = Text("📝 Not Done", style="yellow")
-            elif a.status == AssignmentStatus.UPCOMING:
-                status_text = Text("📅 Upcoming", style="blue")
-            else:
-                status_text = Text("📋 Assigned", style="white")
-
-            # Due date styling
-            due_text = a.display_due
-            if a.is_overdue:
-                due_text = Text(due_text, style="bold red")
-            elif "No due" in due_text:
-                due_text = Text(due_text, style="dim")
-
-            # Type icon
-            type_map = {
-                ItemType.ASSIGNMENT: "📝 Assignment",
-                ItemType.QUIZ: "❓ Quiz",
-                ItemType.ANNOUNCEMENT: "📢 Announce",
-                ItemType.MATERIAL: "📖 Material",
-                ItemType.DISCUSSION: "💬 Discuss",
-                ItemType.EVENT: "📅 Event",
-            }
-            type_text = type_map.get(a.item_type, str(a.item_type.value))
-
-            # Platform
-            platform_text = "🟢 Google" if a.platform == Platform.GOOGLE_CLASSROOM else "🔵 Brightspace"
-
-            table.add_row(
-                str(i),
-                type_text,
-                a.title[:50],
-                status_text,
-                due_text if isinstance(due_text, Text) else str(due_text),
-                platform_text,
-            )
-
-        console.print(table)
-        console.print()
-
-
-def display_summary(all_assignments: list[Assignment]):
-    """Display a summary of all assignments."""
-    console.print(Rule("[bold cyan]Summary[/bold cyan]"))
-    console.print()
-
-    total = len(all_assignments)
-    missing = sum(1 for a in all_assignments if a.status == AssignmentStatus.MISSING)
-    overdue = sum(1 for a in all_assignments if a.is_overdue and a.status != AssignmentStatus.MISSING)
-    upcoming = sum(1 for a in all_assignments if a.status == AssignmentStatus.UPCOMING)
-    not_submitted = sum(1 for a in all_assignments if a.status == AssignmentStatus.NOT_SUBMITTED)
-    announcements = sum(1 for a in all_assignments if a.item_type == ItemType.ANNOUNCEMENT)
-
-    gc_count = sum(1 for a in all_assignments if a.platform == Platform.GOOGLE_CLASSROOM)
-    bs_count = sum(1 for a in all_assignments if a.platform == Platform.BRIGHTSPACE)
-
-    summary_table = Table(box=box.SIMPLE, show_header=False, padding=(0, 2))
-    summary_table.add_column("Label", style="bold")
-    summary_table.add_column("Count", justify="right")
-
-    summary_table.add_row("Total items found", str(total))
-    if missing:
-        summary_table.add_row(Text("⚠ Missing", style="bold red"), Text(str(missing), style="bold red"))
-    if overdue:
-        summary_table.add_row(Text("⏰ Overdue", style="bold red"), Text(str(overdue), style="bold red"))
-    summary_table.add_row("📝 Not submitted", str(not_submitted))
-    summary_table.add_row("📅 Upcoming", str(upcoming))
-    summary_table.add_row("📢 Announcements", str(announcements))
-    summary_table.add_row("", "")
-    summary_table.add_row("🟢 Google Classroom", str(gc_count))
-    summary_table.add_row("🔵 Brightspace", str(bs_count))
-
-    console.print(Panel(summary_table, title="Overview", border_style="cyan"))
-    console.print()
-
-    # Urgency message
-    if missing or overdue:
-        console.print(
-            Panel(
-                f"[bold red]⚠ ATTENTION: {missing + overdue} item(s) are missing or overdue![/bold red]\n"
-                "[yellow]Please check these immediately.[/yellow]",
-                border_style="red",
-            )
-        )
-    elif not_submitted:
-        console.print(
-            Panel(
-                f"[yellow]📝 There are {not_submitted} item(s) that still need to be completed.[/yellow]",
-                border_style="yellow",
-            )
-        )
-    else:
-        console.print(
-            Panel(
-                "[bold green]✅ All caught up! No urgent items.[/bold green]",
-                border_style="green",
-            )
-        )
-
-    console.print()
+    border = "red" if overdue_count else "yellow"
     console.print(
-        f"[dim]Report generated at {datetime.now().strftime('%B %d, %Y %I:%M %p')}[/dim]"
+        Panel("\n".join(lines), title="Summary", border_style=border)
     )
-    console.print()
 
 
-async def run(
+# ─── Core logic ─────────────────────────────────────────────────────────
+
+def run(
     username: str,
     password: str,
     headless: bool = False,
     debug: bool = False,
     semester_classes: list[str] | None = None,
+    skip_gc: bool = False,
+    skip_bs: bool = False,
 ):
-    """Main async workflow."""
-    auth = TDSBAuth(username, password, debug=debug)
-
-    gc_classes: list[ClassInfo] = []
-    bs_classes: list[ClassInfo] = []
+    """Run the aggregator: authenticate, scrape, display."""
     all_assignments: list[Assignment] = []
 
+    auth = TDSBAuth(username=username, password=password, debug=debug)
+
     try:
-        # Start browser
-        with console.status("[bold cyan]Launching browser...[/bold cyan]"):
-            await auth.start_browser(headless=headless)
+        # ─── Launch browser ─────────────────────────────────────────
+        with console.status("[bold green]Starting browser…"):
+            auth.start_browser(headless=headless)
+        console.print("[green]Browser launched.[/green]")
 
-        # ── Google Classroom ────────────────────────────────────────
+        # ─── Google Classroom ───────────────────────────────────────
+        if not skip_gc:
+            console.print()
+            console.rule("[bold green]Google Classroom[/bold green]")
+
+            with console.status("[bold green]Logging into Google Classroom…"):
+                driver = auth.login_google_classroom()
+            console.print("[green]Logged into Google Classroom.[/green]")
+
+            gc_scraper = GoogleClassroomScraper(driver, semester_classes=semester_classes)
+
+            with console.status("[bold green]Scraping Google Classroom…"):
+                gc_classes, gc_assignments = gc_scraper.scrape_all()
+
+            display_classes(gc_classes, "Google Classroom")
+
+            # Filter to actionable items (assignments/quizzes only)
+            gc_actionable = [
+                a for a in gc_assignments
+                if a.item_type in (ItemType.ASSIGNMENT, ItemType.QUIZ)
+            ]
+            display_assignments(gc_actionable, "Google Classroom – Incomplete Work")
+
+            # Also try global to-do
+            with console.status("[bold green]Checking Google Classroom To-Do…"):
+                gc_todo = gc_scraper.scrape_global_todo()
+
+            if gc_todo:
+                existing_titles = {a.title for a in gc_actionable}
+                new_todo = [a for a in gc_todo if a.title not in existing_titles]
+                if new_todo:
+                    display_assignments(new_todo, "Google Classroom – To-Do (Additional)")
+                    gc_actionable.extend(new_todo)
+
+            all_assignments.extend(gc_actionable)
+
+        # ─── Brightspace ────────────────────────────────────────────
+        if not skip_bs:
+            console.print()
+            console.rule("[bold blue]Brightspace[/bold blue]")
+
+            with console.status("[bold blue]Logging into Brightspace…"):
+                driver = auth.login_brightspace()
+            console.print("[blue]Logged into Brightspace.[/blue]")
+
+            bs_scraper = BrightspaceScraper(driver, semester_classes=semester_classes)
+
+            with console.status("[bold blue]Scraping Brightspace…"):
+                bs_classes, bs_assignments = bs_scraper.scrape_all()
+
+            display_classes(bs_classes, "Brightspace")
+
+            bs_actionable = [
+                a for a in bs_assignments
+                if a.item_type in (ItemType.ASSIGNMENT, ItemType.QUIZ, ItemType.ANNOUNCEMENT)
+            ]
+            display_assignments(bs_actionable, "Brightspace – Incomplete Work & Announcements")
+            all_assignments.extend(bs_actionable)
+
+        # ─── Combined summary ───────────────────────────────────────
         console.print()
-        console.print("[bold green]▶ Logging into Google Classroom...[/bold green]")
-        try:
-            with console.status("[bold green]Authenticating with TDSB SSO for Google Classroom...[/bold green]"):
-                gc_context = await auth.login_google_classroom()
+        console.rule("[bold]Combined Summary[/bold]")
 
-            console.print("[green]✓ Google Classroom login successful[/green]")
-
-            with console.status("[bold green]Scraping Google Classroom...[/bold green]"):
-                gc_scraper = GoogleClassroomScraper(gc_context, semester_classes=semester_classes)
-                gc_classes, gc_assignments = await gc_scraper.scrape_all()
-
-                # Also try the global to-do
-                try:
-                    global_todo = await gc_scraper.scrape_global_todo()
-                    existing_titles = {a.title for a in gc_assignments}
-                    for item in global_todo:
-                        if item.title not in existing_titles:
-                            gc_assignments.append(item)
-                except Exception:
-                    pass
-
-            all_assignments.extend(gc_assignments)
-            console.print(
-                f"[green]✓ Found {len(gc_classes)} classes, "
-                f"{len(gc_assignments)} items on Google Classroom[/green]"
+        # Sort: overdue first, then by due date
+        all_assignments.sort(
+            key=lambda a: (
+                not a.is_overdue,
+                a.due_date or datetime(2099, 12, 31),
             )
+        )
 
-        except Exception as e:
-            console.print(f"[red]✗ Google Classroom error: {e}[/red]")
-            if debug:
-                console.print_exception()
-
-        # ── Brightspace ─────────────────────────────────────────────
-        console.print()
-        console.print("[bold blue]▶ Logging into Brightspace...[/bold blue]")
-        try:
-            with console.status("[bold blue]Authenticating with TDSB SSO for Brightspace...[/bold blue]"):
-                bs_context = await auth.login_brightspace()
-
-            console.print("[blue]✓ Brightspace login successful[/blue]")
-
-            with console.status("[bold blue]Scraping Brightspace...[/bold blue]"):
-                bs_scraper = BrightspaceScraper(bs_context, semester_classes=semester_classes)
-                bs_classes, bs_assignments = await bs_scraper.scrape_all()
-
-            all_assignments.extend(bs_assignments)
-            console.print(
-                f"[blue]✓ Found {len(bs_classes)} classes, "
-                f"{len(bs_assignments)} items on Brightspace[/blue]"
-            )
-
-        except Exception as e:
-            console.print(f"[red]✗ Brightspace error: {e}[/red]")
-            if debug:
-                console.print_exception()
-
-        # ── Display Results ─────────────────────────────────────────
-        display_classes(gc_classes, bs_classes)
-        display_assignments(all_assignments)
+        display_assignments(all_assignments, "All Incomplete / Outstanding Work")
         display_summary(all_assignments)
 
     except KeyboardInterrupt:
         console.print("\n[yellow]Interrupted by user.[/yellow]")
     except Exception as e:
-        console.print(f"\n[bold red]Fatal error: {e}[/bold red]")
-        if debug:
-            console.print_exception()
+        console.print(f"\n[bold red]Error:[/bold red] {e}")
+        logger.exception("Fatal error")
     finally:
-        with console.status("[dim]Closing browser...[/dim]"):
-            await auth.close()
+        with console.status("[dim]Closing browser…"):
+            auth.close()
         console.print("[dim]Done.[/dim]")
 
 
+# ─── CLI ────────────────────────────────────────────────────────────────
+
 def main():
+    load_dotenv()
+
     parser = argparse.ArgumentParser(
-        description="TDSB Classroom Assignment Aggregator"
+        description="Aggregate incomplete assignments from Google Classroom & Brightspace"
     )
     parser.add_argument(
-        "--headless",
-        action="store_true",
-        help="Run browser in headless mode (no visible window)",
+        "--username", default=os.getenv("TDSB_USERNAME", ""),
+        help="TDSB email (default: $TDSB_USERNAME from .env)",
     )
     parser.add_argument(
-        "--debug",
-        action="store_true",
-        help="Enable debug logging",
+        "--password", default=os.getenv("TDSB_PASSWORD", ""),
+        help="TDSB password (default: $TDSB_PASSWORD from .env)",
     )
     parser.add_argument(
-        "--username",
-        type=str,
-        default=None,
-        help="TDSB username (will prompt if not provided)",
+        "--headless", action="store_true",
+        default=os.getenv("HEADLESS", "false").lower() in ("true", "1", "yes"),
+        help="Run browser in headless mode",
     )
     parser.add_argument(
-        "--password",
-        type=str,
-        default=None,
-        help="TDSB password (will prompt if not provided)",
+        "--debug", action="store_true",
+        help="Enable debug mode (screenshots, verbose logging)",
     )
+    parser.add_argument(
+        "--skip-gc", action="store_true",
+        help="Skip Google Classroom scraping",
+    )
+    parser.add_argument(
+        "--skip-bs", action="store_true",
+        help="Skip Brightspace scraping",
+    )
+    parser.add_argument(
+        "--classes",
+        default=os.getenv("SEMESTER_CLASSES", "ENG,GLE,PPL,History"),
+        help="Comma-separated semester class codes (default: $SEMESTER_CLASSES)",
+    )
+
     args = parser.parse_args()
 
-    setup_logging(debug=args.debug)
-
-    # Get credentials: CLI args > .env > interactive prompt
-    username = args.username or os.getenv("TDSB_USERNAME") or ""
-    password = args.password or os.getenv("TDSB_PASSWORD") or ""
-
-    if not username or not password:
-        if username:
-            password = getpass.getpass("TDSB Password: ")
-        else:
-            username, password = get_credentials()
-
-    if not username or not password:
-        console.print("[red]Username and password are required.[/red]")
+    if not args.username or not args.password:
+        console.print(
+            "[bold red]Error:[/bold red] Username and password are required.\n"
+            "Set TDSB_USERNAME and TDSB_PASSWORD in .env or pass --username and --password."
+        )
         sys.exit(1)
 
-    # Semester classes from .env (comma-separated) or default
-    semester_env = os.getenv("SEMESTER_CLASSES", "")
-    semester_classes = (
-        [s.strip() for s in semester_env.split(",") if s.strip()]
-        if semester_env
-        else ["ENG", "GLE", "PPL", "History"]
+    # Set up logging
+    log_level = logging.DEBUG if args.debug else logging.WARNING
+    logging.basicConfig(
+        level=log_level,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
     )
 
-    # Headless mode: CLI flag overrides .env
-    headless = args.headless or os.getenv("HEADLESS", "false").lower() in ("true", "1", "yes")
+    semester_classes = [c.strip() for c in args.classes.split(",") if c.strip()]
 
-    # Run the aggregator
-    asyncio.run(run(
-        username, password,
-        headless=headless, debug=args.debug,
+    console.print(
+        Panel(
+            f"[bold]Classroom Aggregator[/bold]\n"
+            f"User: {args.username}\n"
+            f"Classes: {', '.join(semester_classes)}\n"
+            f"Headless: {args.headless} | Debug: {args.debug}",
+            border_style="cyan",
+        )
+    )
+
+    run(
+        username=args.username,
+        password=args.password,
+        headless=args.headless,
+        debug=args.debug,
         semester_classes=semester_classes,
-    ))
+        skip_gc=args.skip_gc,
+        skip_bs=args.skip_bs,
+    )
 
 
 if __name__ == "__main__":

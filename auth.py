@@ -6,14 +6,25 @@ TDSB uses a hybrid authentication model:
 - Google Workspace for Education (federated via Entra) for Google Classroom
 - Brightspace uses TDSB SSO which goes through Entra
 
-This module handles the SSO login flows for both platforms using Playwright
+This module handles the SSO login flows for both platforms using Selenium
 browser automation, since we cannot register an Entra app for API access.
 """
 
-import asyncio
 import logging
 import os
-from playwright.async_api import Page, BrowserContext, Browser, async_playwright
+import tempfile
+import time
+
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import (
+    TimeoutException,
+    NoSuchElementException,
+    WebDriverException,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -38,78 +49,133 @@ class TDSBAuth:
         self.username = username
         self.password = password
         self.debug = debug
-        self._playwright = None
-        self._browser: Browser | None = None
-        self._gc_context: BrowserContext | None = None
-        self._bs_context: BrowserContext | None = None
+        self._driver: webdriver.Chrome = None  # type: ignore[assignment]  # set in start_browser()
+        self._tmp_profile: str | None = None
 
-    async def start_browser(self, headless: bool = False):
-        """Launch the browser using the locally-installed Chrome."""
-        self._playwright = await async_playwright().start()
+    # ─── Browser lifecycle ──────────────────────────────────────────────
+
+    def start_browser(self, headless: bool = False):
+        """Launch the browser using Selenium WebDriver."""
+        options = webdriver.ChromeOptions()
+        if headless:
+            options.add_argument("--headless=new")
+        options.add_argument("--disable-blink-features=AutomationControlled")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--window-size=1280,900")
+        options.add_argument("--lang=en-US")
+        # Force a fresh profile so existing login cookies are not reused
+        self._tmp_profile = tempfile.mkdtemp(prefix="classroom_chrome_")
+        options.add_argument(f"--user-data-dir={self._tmp_profile}")
+        # Disable Windows SSO / Primary Refresh Token so the OS doesn't
+        # inject the machine's corporate Microsoft account automatically.
+        options.add_argument("--disable-features=WebAccountManager")
+        options.add_argument("--auth-server-allowlist=_")
+        options.add_argument("--auth-negotiate-delegate-allowlist=_")
+        # Suppress automation info bars
+        options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        options.add_experimental_option("useAutomationExtension", False)
+
         try:
-            # Use the user's installed Chrome so the version is always current
-            self._browser = await self._playwright.chromium.launch(
-                channel="chrome",
-                headless=headless,
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--no-sandbox",
-                ],
-            )
-            logger.info("Launched installed Chrome (headless=%s)", headless)
-        except Exception:
-            # Fall back to Playwright's bundled Chromium if Chrome isn't installed
-            self._browser = await self._playwright.chromium.launch(
-                headless=headless,
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--no-sandbox",
-                ],
-            )
-            logger.info("Launched bundled Chromium (headless=%s)", headless)
+            # Default: let Selenium Manager find Chrome + chromedriver
+            self._driver = webdriver.Chrome(options=options)
+            logger.info("Launched Chrome (headless=%s)", headless)
+        except WebDriverException:
+            # Fallback: try system Chromium (Raspberry Pi)
+            try:
+                options.binary_location = "/usr/bin/chromium-browser"
+                service = Service("/usr/bin/chromedriver")
+                self._driver = webdriver.Chrome(service=service, options=options)
+                logger.info("Launched system Chromium (headless=%s)", headless)
+            except WebDriverException:
+                # Another common Chromium path
+                options.binary_location = "/usr/bin/chromium"
+                service = Service("/usr/bin/chromedriver")
+                self._driver = webdriver.Chrome(service=service, options=options)
+                logger.info("Launched Chromium at /usr/bin/chromium (headless=%s)", headless)
+
+        self._driver.set_script_timeout(30)
+        self._driver.implicitly_wait(0)  # We use explicit waits
+
         if self.debug:
             os.makedirs(SCREENSHOT_DIR, exist_ok=True)
 
-    async def close(self):
-        """Clean up browser resources — tolerant of already-closed objects."""
-        for label, ctx in [("gc", self._gc_context), ("bs", self._bs_context)]:
-            if ctx is not None:
-                try:
-                    await ctx.close()
-                except Exception as e:
-                    logger.debug("Closing %s context: %s", label, e)
-        if self._browser:
+    def close(self):
+        """Clean up browser resources."""
+        if self._driver:
             try:
-                await self._browser.close()
+                self._driver.quit()
             except Exception as e:
                 logger.debug("Closing browser: %s", e)
-        if self._playwright:
+        # Remove temporary Chrome profile
+        if self._tmp_profile and os.path.isdir(self._tmp_profile):
+            import shutil
             try:
-                await self._playwright.stop()
-            except Exception as e:
-                logger.debug("Stopping playwright: %s", e)
+                shutil.rmtree(self._tmp_profile, ignore_errors=True)
+            except Exception:
+                pass
         logger.info("Browser closed")
 
-    async def _screenshot(self, page: Page, name: str):
+    # ─── Helpers ────────────────────────────────────────────────────────
+
+    def _screenshot(self, name: str):
         """Save a debug screenshot if debug mode is on."""
-        if self.debug:
+        if self.debug and self._driver:
             try:
                 path = os.path.join(SCREENSHOT_DIR, f"{name}.png")
-                await page.screenshot(path=path, full_page=True)
+                self._driver.save_screenshot(path)
                 logger.debug("Screenshot saved: %s", path)
             except Exception as e:
                 logger.debug("Screenshot failed (%s): %s", name, e)
 
-    def _new_context_args(self) -> dict:
-        # No custom user_agent — let the real browser send its own current UA
-        return {
-            "viewport": {"width": 1280, "height": 900},
-            "locale": "en-US",
-        }
+    def _wait_for_page_load(self, timeout: float = 30):
+        """Wait for the page to finish loading (document.readyState == complete)."""
+        try:
+            WebDriverWait(self._driver, timeout).until(
+                lambda d: d.execute_script("return document.readyState") == "complete"
+            )
+        except TimeoutException:
+            logger.debug("Page load wait timed out")
+
+    def _find_visible(self, css_selector: str, timeout: float = 10):
+        """Wait for and return a visible element matching *css_selector*, or ``None``."""
+        try:
+            return WebDriverWait(self._driver, timeout).until(
+                EC.visibility_of_element_located((By.CSS_SELECTOR, css_selector))
+            )
+        except TimeoutException:
+            return None
+
+    def _find_clickable(self, css_selector: str, timeout: float = 10):
+        """Wait for and return a clickable element, or ``None``."""
+        try:
+            return WebDriverWait(self._driver, timeout).until(
+                EC.element_to_be_clickable((By.CSS_SELECTOR, css_selector))
+            )
+        except TimeoutException:
+            return None
+
+    def _find_by_text(self, tag: str, text: str, timeout: float = 5):
+        """Find an element by *tag* whose subtree contains *text*."""
+        try:
+            if "'" not in text:
+                xpath = f"//{tag}[contains(., '{text}')]"
+            elif '"' not in text:
+                xpath = f'//{tag}[contains(., "{text}")]'
+            else:
+                # Escape with concat()
+                parts = text.split("'")
+                concat = ", \"'\", ".join(f"'{p}'" for p in parts)
+                xpath = f"//{tag}[contains(., concat({concat}))]"
+            return WebDriverWait(self._driver, timeout).until(
+                EC.visibility_of_element_located((By.XPATH, xpath))
+            )
+        except TimeoutException:
+            return None
 
     # ─── Google Classroom Login ─────────────────────────────────────────
 
-    async def login_google_classroom(self) -> BrowserContext:
+    def login_google_classroom(self) -> webdriver.Chrome:
         """
         Log into Google Classroom via TDSB SSO.
 
@@ -120,34 +186,40 @@ class TDSBAuth:
           4. Enter password on Entra           → Entra authenticates
           5. Redirect back through Google      → lands on classroom.google.com
         """
-        self._gc_context = await self._browser.new_context(**self._new_context_args())
-        page = await self._gc_context.new_page()
+        # Sign out of any existing Microsoft Entra session first so the
+        # OS/corporate account doesn't get auto-selected by BssoInterrupt.
+        logger.info("Clearing any existing Microsoft Entra session…")
+        try:
+            self._driver.get(
+                "https://login.microsoftonline.com/common/oauth2/v2.0/logout"
+                "?post_logout_redirect_uri=https://accounts.google.com"
+            )
+            time.sleep(3)
+        except Exception as e:
+            logger.debug("Entra logout pre-step: %s", e)
 
-        # ── Step 1: Navigate to Google sign-in (not classroom.google.com) ──
         logger.info("Navigating to Google sign-in page...")
-        await page.goto(self.GOOGLE_LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
-        await page.wait_for_load_state("load", timeout=30000)
-        await self._screenshot(page, "01_google_signin_page")
-        logger.info("Google sign-in page loaded: %s", page.url)
+        self._driver.get(self.GOOGLE_LOGIN_URL)
+        self._wait_for_page_load()
+        self._screenshot("01_google_signin_page")
+        logger.info("Google sign-in page loaded: %s", self._driver.current_url)
 
-        # ── Step 2: Enter email on the Google sign-in form ──
-        await self._handle_google_sign_in(page)
+        # Step 2: Enter email on the Google sign-in form
+        self._handle_google_sign_in()
 
-        # ── Step 3+4: Handle Entra login (Google needs generous timeouts) ──
-        await self._handle_entra_login_google(page)
+        # Step 3+4: Handle Entra login (Google needs generous timeouts)
+        self._handle_entra_login_google()
 
-        # ── Step 5: Wait for Google Classroom to fully load ──
-        await self._wait_for_google_classroom(page)
+        # Step 5: Wait for Google Classroom to fully load
+        self._wait_for_google_classroom()
 
-        logger.info("Google Classroom login complete — url: %s", page.url)
-        return self._gc_context
+        logger.info("Google Classroom login complete — url: %s", self._driver.current_url)
+        return self._driver
 
-    async def _handle_google_sign_in(self, page: Page):
+    def _handle_google_sign_in(self):
         """Handle the Google sign-in / account chooser page."""
-        current = page.url
-        logger.info("Handling Google sign-in — current URL: %s", current)
+        logger.info("Handling Google sign-in — current URL: %s", self._driver.current_url)
 
-        # Google sign-in has several possible selectors for the email field
         email_selectors = [
             'input[type="email"]',
             'input#identifierId',
@@ -156,92 +228,90 @@ class TDSBAuth:
 
         filled = False
         for sel in email_selectors:
-            try:
-                locator = page.locator(sel)
-                await locator.first.wait_for(state="visible", timeout=10000)
-                await locator.first.fill(self.username)
+            el = self._find_visible(sel, timeout=10)
+            if el:
+                el.clear()
+                el.send_keys(self.username)
                 logger.info("Filled email with selector: %s", sel)
                 filled = True
                 break
-            except Exception:
-                continue
 
         if not filled:
-            # Maybe we're already past this page or on a different page
-            await self._screenshot(page, "02_email_not_found")
+            self._screenshot("02_email_not_found")
             logger.warning(
-                "Could not find email input on Google page. URL: %s", page.url
+                "Could not find email input on Google page. URL: %s",
+                self._driver.current_url,
             )
-            # Check if there's a "Sign in" or "Use another account" button
+            # Check if there's a "Use another account" or "Sign in" button
             try:
-                alt = page.locator(
-                    'div:has-text("Use another account"), '
-                    'div:has-text("Sign in"), '
-                    'button:has-text("Sign in")'
-                )
-                if await alt.count() > 0:
-                    await alt.first.click()
-                    await page.wait_for_timeout(2000)
-                    # Retry email entry
-                    for sel in email_selectors:
-                        try:
-                            loc = page.locator(sel)
-                            await loc.first.wait_for(state="visible", timeout=5000)
-                            await loc.first.fill(self.username)
-                            filled = True
-                            break
-                        except Exception:
-                            continue
+                for text in ["Use another account", "Sign in"]:
+                    btn = self._find_by_text("div", text, timeout=3)
+                    if not btn:
+                        btn = self._find_by_text("button", text, timeout=2)
+                    if btn:
+                        btn.click()
+                        time.sleep(2)
+                        break
+                # Retry email entry
+                for sel in email_selectors:
+                    el = self._find_visible(sel, timeout=5)
+                    if el:
+                        el.clear()
+                        el.send_keys(self.username)
+                        filled = True
+                        break
             except Exception:
                 pass
 
         if not filled:
-            await self._screenshot(page, "02_email_still_not_found")
-            logger.error("FAILED to enter email — page URL: %s", page.url)
+            self._screenshot("02_email_still_not_found")
+            logger.error("FAILED to enter email — page URL: %s", self._driver.current_url)
             return
 
-        await self._screenshot(page, "02_email_entered")
+        self._screenshot("02_email_entered")
 
-        # Click "Next" — Google uses either a button#identifierNext or type=submit
+        # Click "Next"
         next_selectors = [
-            '#identifierNext',
-            'button:has-text("Next")',
+            "#identifierNext",
             'input[type="submit"]',
             'button[type="submit"]',
         ]
+        clicked = False
         for sel in next_selectors:
-            try:
-                btn = page.locator(sel)
-                if await btn.count() > 0 and await btn.first.is_visible():
-                    await btn.first.click()
-                    logger.info("Clicked Next with selector: %s", sel)
-                    break
-            except Exception:
-                continue
+            btn = self._find_clickable(sel, timeout=3)
+            if btn:
+                btn.click()
+                logger.info("Clicked Next with selector: %s", sel)
+                clicked = True
+                break
 
-        # Wait for navigation — Google will redirect to Entra for @tdsb.ca
+        if not clicked:
+            btn = self._find_by_text("button", "Next", timeout=3)
+            if btn:
+                btn.click()
+                logger.info("Clicked Next via text match")
+
+        # Wait for redirect to Entra SSO
         logger.info("Waiting for redirect to TDSB Entra SSO...")
         try:
-            # Wait for either Entra page or a password field
-            await page.wait_for_function(
-                """() => {
-                    return window.location.hostname.includes('microsoftonline') ||
-                           window.location.hostname.includes('login.microsoft') ||
-                           window.location.hostname.includes('login.live') ||
-                           window.location.hostname.includes('tdsb') ||
-                           document.querySelector('input[type="password"]') !== null;
-                }""",
-                timeout=20000,
+            WebDriverWait(self._driver, 20).until(
+                lambda d: (
+                    any(
+                        x in d.current_url
+                        for x in ["microsoftonline", "login.microsoft", "login.live", "tdsb"]
+                    )
+                    or len(d.find_elements(By.CSS_SELECTOR, 'input[type="password"]')) > 0
+                )
             )
-        except Exception as e:
-            logger.warning("Redirect wait: %s — current URL: %s", e, page.url)
+        except TimeoutException:
+            logger.warning("Redirect wait timeout — URL: %s", self._driver.current_url)
 
-        await self._screenshot(page, "03_after_google_next")
-        logger.info("After clicking Next — URL: %s", page.url)
+        self._screenshot("03_after_google_next")
+        logger.info("After clicking Next — URL: %s", self._driver.current_url)
 
     # ─── Google-specific Entra handler (generous timeouts) ───────────
 
-    async def _handle_entra_login_google(self, page: Page):
+    def _handle_entra_login_google(self):
         """
         Handle Entra login after Google redirect.
 
@@ -249,87 +319,133 @@ class TDSBAuth:
         We use generous timeouts here because Google auth is the first
         login and there's no existing Entra session to reuse.
         """
-        source = "google_classroom"
-        logger.info("Handling Entra login (Google) — URL: %s", page.url)
-        await self._screenshot(page, "04_entra_start_google")
+        logger.info("Handling Entra login (Google) — URL: %s", self._driver.current_url)
+        self._screenshot("04_entra_start_google")
 
         try:
-            # ── 1. Wait for real Entra form (past BssoInterrupt) ──
-            logger.info("Waiting for Entra login form (BssoInterrupt may take a few seconds)…")
-            username_field = None
-            try:
-                loc = page.locator('input[name="loginfmt"]')
-                await loc.wait_for(state="visible", timeout=30000)
-                username_field = loc
-                logger.info("Standard Entra username field found")
-            except Exception:
-                for sel in ['input[name="UserName"]', 'input[name="login"]', 'input[type="email"]']:
-                    try:
-                        loc = page.locator(sel)
-                        await loc.first.wait_for(state="visible", timeout=5000)
-                        username_field = loc.first
+            # 0. Check for AADSTS error (wrong account auto-selected by Windows SSO)
+            self._handle_entra_wrong_account_error()
+
+            # 1. Wait for real Entra form (past BssoInterrupt)
+            logger.info(
+                "Waiting for Entra login form (BssoInterrupt may take a few seconds)…"
+            )
+            username_field = self._find_visible('input[name="loginfmt"]', timeout=30)
+            if not username_field:
+                for sel in [
+                    'input[name="UserName"]',
+                    'input[name="login"]',
+                    'input[type="email"]',
+                ]:
+                    username_field = self._find_visible(sel, timeout=5)
+                    if username_field:
                         logger.info("Found username field with fallback: %s", sel)
                         break
-                    except Exception:
-                        continue
 
             if username_field is None:
-                await self._screenshot(page, "04_entra_no_username_google")
-                logger.error("No username field found on Entra (Google) — URL: %s", page.url)
+                self._screenshot("04_entra_no_username_google")
+                logger.error(
+                    "No username field found on Entra (Google) — URL: %s",
+                    self._driver.current_url,
+                )
                 return
 
-            await self._screenshot(page, "05_entra_username_visible_google")
+            self._screenshot("05_entra_username_visible_google")
 
-            # ── 2. Enter username and click Next ──
-            await username_field.fill(self.username)
+            # 2. Enter username and click Next
+            username_field.clear()
+            username_field.send_keys(self.username)
             logger.info("Entered username on Entra")
-            next_btn = page.locator("#idSIButton9")
-            await next_btn.click()
+            btn = self._find_clickable("#idSIButton9", timeout=5)
+            if btn:
+                btn.click()
             logger.info("Clicked Next on Entra username page")
-            await page.wait_for_timeout(2000)
-            await self._screenshot(page, "05_entra_after_next_google")
+            time.sleep(2)
+            self._screenshot("05_entra_after_next_google")
 
-            # ── 3. Wait for password field ──
+            # 3. Wait for password field
             logger.info("Waiting for password field…")
-            passwd_loc = page.locator('input[name="passwd"]')
-            try:
-                await passwd_loc.first.wait_for(state="visible", timeout=15000)
-            except Exception:
-                for sel in ['input[name="Password"]', 'input[name="password"]', 'input[type="password"]:visible']:
-                    try:
-                        loc = page.locator(sel)
-                        await loc.first.wait_for(state="visible", timeout=5000)
-                        passwd_loc = loc
+            passwd_field = self._find_visible('input[name="passwd"]', timeout=15)
+            if not passwd_field:
+                for sel in [
+                    'input[name="Password"]',
+                    'input[name="password"]',
+                    'input[type="password"]',
+                ]:
+                    passwd_field = self._find_visible(sel, timeout=5)
+                    if passwd_field:
                         break
-                    except Exception:
-                        continue
-                else:
-                    await self._screenshot(page, "06_no_password_google")
-                    logger.error("No password field (Google) — URL: %s", page.url)
+                if not passwd_field:
+                    self._screenshot("06_no_password_google")
+                    logger.error(
+                        "No password field (Google) — URL: %s",
+                        self._driver.current_url,
+                    )
                     return
 
-            await passwd_loc.first.fill(self.password)
+            passwd_field.clear()
+            passwd_field.send_keys(self.password)
             logger.info("Entered password on Entra")
-            await self._screenshot(page, "06_password_entered_google")
+            self._screenshot("06_password_entered_google")
 
-            # ── 4. Click Sign In ──
-            signin_btn = page.locator("#idSIButton9")
-            await signin_btn.click()
+            # 4. Click Sign In
+            btn = self._find_clickable("#idSIButton9", timeout=5)
+            if btn:
+                btn.click()
             logger.info("Clicked Sign In on Entra")
-            await page.wait_for_timeout(3000)
-            await self._screenshot(page, "07_after_signin_google")
-            logger.info("After sign-in — URL: %s", page.url)
+            time.sleep(3)
+            self._screenshot("07_after_signin_google")
+            logger.info("After sign-in — URL: %s", self._driver.current_url)
 
-            # ── 5. Handle "Stay signed in?" (generous timeouts for Google) ──
-            await self._handle_stay_signed_in(page, wait_timeout=8000, post_click_wait=3000)
+            # 5. Handle "Stay signed in?" (generous timeouts for Google)
+            self._handle_stay_signed_in(wait_timeout=8, post_click_wait=3)
 
         except Exception as e:
-            await self._screenshot(page, "08_entra_error_google")
-            logger.error("Entra login error (Google): %s — URL: %s", e, page.url)
+            self._screenshot("08_entra_error_google")
+            logger.error(
+                "Entra login error (Google): %s — URL: %s",
+                e,
+                self._driver.current_url,
+            )
+
+    def _handle_entra_wrong_account_error(self):
+        """
+        Detect and recover from AADSTS50178 / other errors where Windows SSO
+        auto-submitted with the wrong Microsoft account (e.g. a corporate
+        marfra@microsoft.com instead of the TDSB student account).
+        """
+        page_text = self._driver.page_source or ""
+        if "AADSTS" in page_text or "does not exist in tenant" in page_text:
+            logger.warning("Detected Entra wrong-account error — recovering…")
+            self._screenshot("04_entra_wrong_account")
+
+            # Try clicking any "sign in with a different account" links
+            for text in [
+                "Sign in with a different account",
+                "sign in with another account",
+                "Use a different account",
+                "Sign out and sign in",
+                "Sign out",
+            ]:
+                link = self._find_by_text("a", text, timeout=2)
+                if link:
+                    link.click()
+                    logger.info("Clicked '%s' to recover from wrong-account", text)
+                    time.sleep(3)
+                    self._screenshot("04_entra_after_recovery_click")
+                    return
+
+            # Fallback: navigate directly to Entra logout, then restart
+            logger.info("No recovery link found — signing out of Entra explicitly")
+            self._driver.get(
+                "https://login.microsoftonline.com/common/oauth2/v2.0/logout"
+                "?post_logout_redirect_uri=https://accounts.google.com"
+            )
+            time.sleep(3)
 
     # ─── Brightspace Entra handler (fast, with SSO auto-complete) ─────
 
-    async def _handle_entra_login(self, page: Page, source: str = ""):
+    def _handle_entra_login(self, source: str = ""):
         """
         Handle Entra login for Brightspace.
 
@@ -337,279 +453,312 @@ class TDSBAuth:
         auto-complete and redirect straight to Brightspace with no login form.
         We race the login form against the destination URL.
         """
-        logger.info("Handling Entra login (%s) — URL: %s", source, page.url)
-        await self._screenshot(page, f"04_entra_start_{source}")
+        logger.info("Handling Entra login (%s) — URL: %s", source, self._driver.current_url)
+        self._screenshot(f"04_entra_start_{source}")
 
         try:
-            # ── 1. Race: login form vs SSO auto-complete ──
+            # 1. Race: login form vs SSO auto-complete
             logger.info("Waiting for Entra form or SSO auto-complete…")
             username_field = None
             try:
-                await page.wait_for_function(
-                    """() => {
-                        const el = document.querySelector('input[name="loginfmt"]');
-                        if (el && el.offsetParent !== null) return true;
-                        const h = window.location.hostname;
-                        if (h.includes('elearningontario') || h.includes('classroom.google'))
-                            return true;
-                        return false;
-                    }""",
-                    timeout=15000,
+                WebDriverWait(self._driver, 15).until(
+                    lambda d: (
+                        # loginfmt field is visible
+                        any(
+                            e.is_displayed()
+                            for e in d.find_elements(
+                                By.CSS_SELECTOR, 'input[name="loginfmt"]'
+                            )
+                        )
+                        # Or we've already arrived at the destination
+                        or "elearningontario" in d.current_url
+                        or "classroom.google" in d.current_url
+                    )
                 )
-                if "elearningontario" in page.url or "classroom.google" in page.url:
-                    logger.info("SSO auto-completed — already on destination: %s", page.url)
+                if (
+                    "elearningontario" in self._driver.current_url
+                    or "classroom.google" in self._driver.current_url
+                ):
+                    logger.info(
+                        "SSO auto-completed — already on destination: %s",
+                        self._driver.current_url,
+                    )
                     return
-                loc = page.locator('input[name="loginfmt"]')
-                username_field = loc
+                username_field = self._find_visible('input[name="loginfmt"]', timeout=2)
                 logger.info("Standard Entra username field found")
-            except Exception:
-                # Check if we redirected during the wait
-                if "elearningontario" in page.url:
-                    logger.info("SSO auto-completed during fallback — URL: %s", page.url)
+            except TimeoutException:
+                if "elearningontario" in self._driver.current_url:
+                    logger.info(
+                        "SSO auto-completed during fallback — URL: %s",
+                        self._driver.current_url,
+                    )
                     return
-                for sel in ['input[name="UserName"]', 'input[name="login"]', 'input[type="email"]']:
-                    try:
-                        loc = page.locator(sel)
-                        await loc.first.wait_for(state="visible", timeout=3000)
-                        username_field = loc.first
+                for sel in [
+                    'input[name="UserName"]',
+                    'input[name="login"]',
+                    'input[type="email"]',
+                ]:
+                    username_field = self._find_visible(sel, timeout=3)
+                    if username_field:
                         logger.info("Found username field with fallback: %s", sel)
                         break
-                    except Exception:
-                        continue
 
             if username_field is None:
-                # Final check — maybe we landed on Brightspace while in fallback
-                if "elearningontario" in page.url:
-                    logger.info("SSO auto-completed — URL: %s", page.url)
+                if "elearningontario" in self._driver.current_url:
+                    logger.info("SSO auto-completed — URL: %s", self._driver.current_url)
                     return
-                await self._screenshot(page, f"04_entra_no_username_{source}")
-                logger.error("No username field found on Entra (%s) — URL: %s", source, page.url)
+                self._screenshot(f"04_entra_no_username_{source}")
+                logger.error(
+                    "No username field found on Entra (%s) — URL: %s",
+                    source,
+                    self._driver.current_url,
+                )
                 return
 
-            await self._screenshot(page, f"05_entra_username_visible_{source}")
+            self._screenshot(f"05_entra_username_visible_{source}")
 
-            # ── 2. Enter username and click Next ──
-            await username_field.fill(self.username)
+            # 2. Enter username and click Next
+            username_field.clear()
+            username_field.send_keys(self.username)
             logger.info("Entered username on Entra")
-            next_btn = page.locator("#idSIButton9")
-            await next_btn.click()
+            btn = self._find_clickable("#idSIButton9", timeout=5)
+            if btn:
+                btn.click()
             logger.info("Clicked Next on Entra username page")
-            await page.wait_for_timeout(1000)
-            await self._screenshot(page, f"05_entra_after_next_{source}")
+            time.sleep(1)
+            self._screenshot(f"05_entra_after_next_{source}")
 
-            # ── 3. Wait for password field ──
+            # 3. Wait for password field
             logger.info("Waiting for password field…")
-            passwd_loc = page.locator('input[name="passwd"]')
-            try:
-                await passwd_loc.first.wait_for(state="visible", timeout=15000)
-            except Exception:
-                for sel in ['input[name="Password"]', 'input[name="password"]', 'input[type="password"]:visible']:
-                    try:
-                        loc = page.locator(sel)
-                        await loc.first.wait_for(state="visible", timeout=5000)
-                        passwd_loc = loc
+            passwd_field = self._find_visible('input[name="passwd"]', timeout=15)
+            if not passwd_field:
+                for sel in [
+                    'input[name="Password"]',
+                    'input[name="password"]',
+                    'input[type="password"]',
+                ]:
+                    passwd_field = self._find_visible(sel, timeout=5)
+                    if passwd_field:
                         break
-                    except Exception:
-                        continue
-                else:
-                    await self._screenshot(page, f"06_no_password_field_{source}")
-                    logger.error("No password field (%s) — URL: %s", source, page.url)
+                if not passwd_field:
+                    self._screenshot(f"06_no_password_field_{source}")
+                    logger.error(
+                        "No password field (%s) — URL: %s",
+                        source,
+                        self._driver.current_url,
+                    )
                     return
 
-            await passwd_loc.first.fill(self.password)
+            passwd_field.clear()
+            passwd_field.send_keys(self.password)
             logger.info("Entered password on Entra")
-            await self._screenshot(page, f"06_password_entered_{source}")
+            self._screenshot(f"06_password_entered_{source}")
 
-            # ── 4. Click Sign In ──
-            signin_btn = page.locator("#idSIButton9")
-            await signin_btn.click()
+            # 4. Click Sign In
+            btn = self._find_clickable("#idSIButton9", timeout=5)
+            if btn:
+                btn.click()
             logger.info("Clicked Sign In on Entra")
-            await page.wait_for_timeout(1000)
-            await self._screenshot(page, f"07_after_signin_{source}")
-            logger.info("After sign-in — URL: %s", page.url)
+            time.sleep(1)
+            self._screenshot(f"07_after_signin_{source}")
+            logger.info("After sign-in — URL: %s", self._driver.current_url)
 
-            # ── 5. Handle "Stay signed in?" ──
-            await self._handle_stay_signed_in(page)
+            # 5. Handle "Stay signed in?"
+            self._handle_stay_signed_in()
 
         except Exception as e:
-            await self._screenshot(page, f"08_entra_error_{source}")
-            logger.error("Entra login error (%s): %s — URL: %s", source, e, page.url)
+            self._screenshot(f"08_entra_error_{source}")
+            logger.error(
+                "Entra login error (%s): %s — URL: %s",
+                source,
+                e,
+                self._driver.current_url,
+            )
 
-    async def _handle_stay_signed_in(
-        self, page: Page, wait_timeout: int = 3000, post_click_wait: int = 1000
+    def _handle_stay_signed_in(
+        self, wait_timeout: float = 3, post_click_wait: float = 1
     ):
         """Handle the 'Stay signed in?' / 'Don't show this again' prompt."""
         try:
-            # Entra "Stay signed in?" has id=idSIButton9 for "Yes"
-            stay_yes = page.locator(
-                '#idSIButton9, '
-                'input[type="submit"][value="Yes"], '
-                'button:has-text("Yes")'
-            )
-            await stay_yes.first.wait_for(state="visible", timeout=wait_timeout)
-            await stay_yes.first.click()
-            logger.info("Clicked 'Yes' on Stay signed in prompt")
-            await page.wait_for_timeout(post_click_wait)
-            await self._screenshot(page, "09_after_stay_signed_in")
+            selectors = [
+                "#idSIButton9",
+                'input[type="submit"][value="Yes"]',
+            ]
+            for sel in selectors:
+                btn = self._find_clickable(sel, timeout=wait_timeout)
+                if btn:
+                    btn.click()
+                    logger.info("Clicked 'Yes' on Stay signed in prompt")
+                    time.sleep(post_click_wait)
+                    self._screenshot("09_after_stay_signed_in")
+                    return
+
+            # Also try text-based
+            btn = self._find_by_text("button", "Yes", timeout=wait_timeout)
+            if btn:
+                btn.click()
+                logger.info("Clicked 'Yes' on Stay signed in prompt (via text)")
+                time.sleep(post_click_wait)
+                self._screenshot("09_after_stay_signed_in")
+                return
         except Exception:
-            # Prompt didn't appear — that's fine
             logger.debug("No 'Stay signed in' prompt detected")
 
-    async def _wait_for_google_classroom(self, page: Page):
+    def _wait_for_google_classroom(self):
         """Wait for Google Classroom main page to load after SSO."""
         logger.info("Waiting for Google Classroom to load...")
         try:
-            # Wait for the URL to contain classroom.google.com
-            await page.wait_for_url(
-                "**/classroom.google.com/**", timeout=45000
+            WebDriverWait(self._driver, 45).until(
+                EC.url_contains("classroom.google.com")
             )
-            await page.wait_for_load_state("load", timeout=30000)
-            await page.wait_for_timeout(3000)
-            await self._screenshot(page, "10_google_classroom_loaded")
-            logger.info("Google Classroom loaded: %s", page.url)
-        except Exception as e:
-            await self._screenshot(page, "10_google_classroom_fail")
+            self._wait_for_page_load(timeout=30)
+            time.sleep(3)
+            self._screenshot("10_google_classroom_loaded")
+            logger.info("Google Classroom loaded: %s", self._driver.current_url)
+        except TimeoutException:
+            self._screenshot("10_google_classroom_fail")
             logger.warning(
-                "Google Classroom wait issue: %s — final URL: %s", e, page.url
+                "Google Classroom wait issue — final URL: %s",
+                self._driver.current_url,
             )
 
     # ─── Brightspace Login ──────────────────────────────────────────────
 
-    async def login_brightspace(self) -> BrowserContext:
+    def login_brightspace(self) -> webdriver.Chrome:
         """
         Log into Brightspace via TDSB SSO.
         Flow: Brightspace landing → click "Staff And Students Login"
               → TDSB SSO (Entra) → login → redirect back to Brightspace.
         """
-        self._bs_context = await self._browser.new_context(**self._new_context_args())
-        page = await self._bs_context.new_page()
-
         logger.info("Navigating to Brightspace...")
-        await page.goto(
-            self.BRIGHTSPACE_URL, wait_until="domcontentloaded", timeout=60000
+        self._driver.get(self.BRIGHTSPACE_URL)
+        self._wait_for_page_load()
+        self._screenshot("20_brightspace_start")
+        logger.info("Brightspace start page: %s", self._driver.current_url)
+
+        # Click the "Staff And Students Login" button
+        self._handle_brightspace_landing()
+
+        # Handle Entra login (SSO may auto-complete from Google session)
+        already_on_bs = (
+            "elearningontario.ca" in self._driver.current_url
+            and "/d2l/" in self._driver.current_url
         )
-        await page.wait_for_load_state("load", timeout=30000)
-        await self._screenshot(page, "20_brightspace_start")
-        logger.info("Brightspace start page: %s", page.url)
-
-        # The landing page has a "Staff And Students Login" button that must
-        # be clicked before we get redirected to Entra SSO.
-        await self._handle_brightspace_landing(page)
-
-        # Handle Entra login — but if we already have an Entra session from
-        # Google Classroom, SSO may auto-complete and skip the login form.
-        # Check whether we've already landed on Brightspace first.
-        already_on_bs = "elearningontario.ca" in page.url and "/d2l/" in page.url
         if already_on_bs:
             logger.info("Already on Brightspace (SSO auto-completed) — skipping Entra login")
         else:
-            await self._handle_entra_login(page, source="brightspace")
+            self._handle_entra_login(source="brightspace")
 
         # Wait for Brightspace to load
-        await self._wait_for_brightspace(page)
+        self._wait_for_brightspace()
 
-        logger.info("Brightspace login complete — url: %s", page.url)
-        return self._bs_context
+        logger.info("Brightspace login complete — url: %s", self._driver.current_url)
+        return self._driver
 
-    async def _handle_brightspace_landing(self, page: Page):
+    def _handle_brightspace_landing(self):
         """Click 'Staff And Students Login' on the Brightspace landing page."""
         try:
-            # Look for the green "Staff And Students Login" button
-            btn_selectors = [
-                'a:has-text("Staff And Students Login")',
-                'button:has-text("Staff And Students Login")',
-                'a:has-text("Staff and Students")',
-                'a:has-text("Staff")',
+            btn_texts = [
+                "Staff And Students Login",
+                "Staff and Students",
+                "Staff",
             ]
             clicked = False
-            for sel in btn_selectors:
-                try:
-                    loc = page.locator(sel)
-                    if await loc.count() > 0 and await loc.first.is_visible():
-                        await loc.first.click()
-                        logger.info("Clicked Brightspace login button: %s", sel)
-                        clicked = True
-                        break
-                except Exception:
-                    continue
+            for text in btn_texts:
+                for tag in ["a", "button"]:
+                    btn = self._find_by_text(tag, text, timeout=3)
+                    if btn:
+                        try:
+                            if btn.is_displayed():
+                                btn.click()
+                                logger.info(
+                                    "Clicked Brightspace login button: <%s> '%s'",
+                                    tag,
+                                    text,
+                                )
+                                clicked = True
+                                break
+                        except Exception:
+                            continue
+                if clicked:
+                    break
 
             if not clicked:
-                await self._screenshot(page, "20_no_staff_button")
+                self._screenshot("20_no_staff_button")
                 logger.warning(
-                    "Could not find 'Staff And Students Login' — URL: %s", page.url
+                    "Could not find 'Staff And Students Login' — URL: %s",
+                    self._driver.current_url,
                 )
                 return
 
-            # Wait for the redirect to Entra SSO
+            # Wait for redirect to Entra SSO
             logger.info("Waiting for Entra SSO redirect after clicking login...")
             try:
-                await page.wait_for_function(
-                    """() => {
-                        return window.location.hostname.includes('microsoftonline') ||
-                               window.location.hostname.includes('login.microsoft') ||
-                               window.location.hostname.includes('login.live') ||
-                               document.querySelector('input[type="password"]') !== null ||
-                               document.querySelector('input[name="loginfmt"]') !== null;
-                    }""",
-                    timeout=20000,
+                WebDriverWait(self._driver, 20).until(
+                    lambda d: (
+                        any(
+                            x in d.current_url
+                            for x in ["microsoftonline", "login.microsoft", "login.live"]
+                        )
+                        or len(d.find_elements(By.CSS_SELECTOR, 'input[type="password"]')) > 0
+                        or len(d.find_elements(By.CSS_SELECTOR, 'input[name="loginfmt"]')) > 0
+                    )
                 )
-            except Exception as e:
-                logger.warning("Entra redirect wait: %s — URL: %s", e, page.url)
+            except TimeoutException:
+                logger.warning(
+                    "Entra redirect wait timeout — URL: %s", self._driver.current_url
+                )
 
-            await page.wait_for_timeout(2000)
-            await self._screenshot(page, "20_after_staff_login_click")
-            logger.info("After staff login click — URL: %s", page.url)
+            time.sleep(2)
+            self._screenshot("20_after_staff_login_click")
+            logger.info("After staff login click — URL: %s", self._driver.current_url)
 
         except Exception as e:
-            await self._screenshot(page, "20_landing_error")
+            self._screenshot("20_landing_error")
             logger.warning("Brightspace landing handling error: %s", e)
 
-    async def _wait_for_brightspace(self, page: Page):
+    def _wait_for_brightspace(self):
         """Wait for Brightspace homepage to load."""
         try:
-            # If not already on Brightspace, wait for the redirect
-            if "elearningontario.ca" not in page.url:
-                await page.wait_for_url(
-                    "**/elearningontario.ca/**", timeout=30000
+            if "elearningontario.ca" not in self._driver.current_url:
+                WebDriverWait(self._driver, 30).until(
+                    EC.url_contains("elearningontario.ca")
                 )
             # domcontentloaded is enough — 'load' hangs on Brightspace's
             # heavy async resource loading.
-            await page.wait_for_load_state("domcontentloaded", timeout=15000)
+            self._wait_for_page_load(timeout=15)
 
             # Dismiss the "Your browser is looking a little retro" modal
-            # that Brightspace shows for older Chrome user-agents.
-            await self._dismiss_brightspace_browser_warning(page)
+            self._dismiss_brightspace_browser_warning()
 
-            await self._screenshot(page, "21_brightspace_loaded")
-            logger.info("Brightspace loaded: %s", page.url)
-        except Exception as e:
-            await self._screenshot(page, "21_brightspace_fail")
+            self._screenshot("21_brightspace_loaded")
+            logger.info("Brightspace loaded: %s", self._driver.current_url)
+        except TimeoutException:
+            self._screenshot("21_brightspace_fail")
             logger.warning(
-                "Brightspace wait issue: %s — final URL: %s", e, page.url
+                "Brightspace wait issue — final URL: %s", self._driver.current_url
             )
 
-    async def _dismiss_brightspace_browser_warning(self, page: Page):
+    def _dismiss_brightspace_browser_warning(self):
         """Dismiss the 'Your browser is looking a little retro' dialog if present."""
         try:
-            got_it = page.locator(
-                'button:has-text("Got It"), '
-                'button:has-text("Got it"), '
-                'a:has-text("Got It"), '
-                'a:has-text("Got it")'
-            )
-            if await got_it.count() > 0 and await got_it.first.is_visible():
-                await got_it.first.click()
-                logger.info("Dismissed 'browser retro' warning dialog")
-                await page.wait_for_timeout(1000)
+            for text in ["Got It", "Got it"]:
+                for tag in ["button", "a"]:
+                    btn = self._find_by_text(tag, text, timeout=2)
+                    if btn:
+                        try:
+                            if btn.is_displayed():
+                                btn.click()
+                                logger.info("Dismissed 'browser retro' warning dialog")
+                                time.sleep(1)
+                                return
+                        except Exception:
+                            continue
         except Exception:
             pass  # No dialog — that's fine
 
     # ─── Convenience ────────────────────────────────────────────────────
 
     @property
-    def gc_context(self) -> BrowserContext | None:
-        return self._gc_context
-
-    @property
-    def bs_context(self) -> BrowserContext | None:
-        return self._bs_context
+    def driver(self) -> webdriver.Chrome | None:
+        return self._driver

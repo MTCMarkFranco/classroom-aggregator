@@ -1,18 +1,24 @@
 """
 Google Classroom Scraper.
 
-Scrapes class list and assignments from Google Classroom using Playwright.
+Scrapes class list and assignments from Google Classroom using Selenium.
 Google Classroom is a heavily JS-rendered SPA, so we use browser automation
 to interact with it.
 """
 
-import asyncio
 import logging
 import re
+import time
 from datetime import datetime
 from typing import Optional
+
 from dateutil import parser as dateparser
-from playwright.async_api import BrowserContext, Page
+from selenium.webdriver.remote.webdriver import WebDriver
+from selenium.webdriver.remote.webelement import WebElement
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException, NoSuchElementException
 
 from models import (
     ClassInfo, Assignment, Platform, AssignmentStatus, ItemType
@@ -49,29 +55,43 @@ class GoogleClassroomScraper:
 
     BASE_URL = "https://classroom.google.com"
 
-    def __init__(self, context: BrowserContext, semester_classes: list[str] | None = None):
+    def __init__(self, driver: WebDriver, semester_classes: list[str] | None = None):
         self.semester_classes = semester_classes or DEFAULT_SEMESTER_CLASSES
-        self.context = context
+        self.driver = driver
         self.classes: list[ClassInfo] = []
         self.assignments: list[Assignment] = []
 
-    async def scrape_all(self) -> tuple[list[ClassInfo], list[Assignment]]:
-        """Main entry: scrape classes then assignments for each matching class."""
-        page = self.context.pages[0] if self.context.pages else await self.context.new_page()
+    # ─── Helpers ────────────────────────────────────────────────────────
 
+    def _wait_for_load(self, timeout: float = 30):
+        try:
+            WebDriverWait(self.driver, timeout).until(
+                lambda d: d.execute_script("return document.readyState") == "complete"
+            )
+        except TimeoutException:
+            pass
+
+    # ─── Main entry ─────────────────────────────────────────────────────
+
+    def scrape_all(self) -> tuple[list[ClassInfo], list[Assignment]]:
+        """Main entry: scrape classes then assignments for each matching class."""
         # Navigate to class list
-        await page.goto(f"{self.BASE_URL}/h", wait_until="load", timeout=30000)
-        await page.wait_for_timeout(3000)
+        self.driver.get(f"{self.BASE_URL}/h")
+        self._wait_for_load()
+        time.sleep(3)
 
         # Get all classes
-        all_classes = await self._scrape_class_list(page)
+        all_classes = self._scrape_class_list()
         logger.info("Found %d total classes on Google Classroom", len(all_classes))
 
         # Filter to semester classes
-        self.classes = [c for c in all_classes if _matches_semester_class(c.name, self.semester_classes)]
+        self.classes = [
+            c for c in all_classes
+            if _matches_semester_class(c.name, self.semester_classes)
+        ]
         logger.info("Matched %d semester classes on Google Classroom", len(self.classes))
 
-        # If no filtered matches, use all classes (user can filter later)
+        # If no filtered matches, use all classes
         if not self.classes:
             logger.warning("No semester class matches found, using all classes")
             self.classes = all_classes
@@ -79,18 +99,20 @@ class GoogleClassroomScraper:
         # Scrape assignments for each class
         for cls in self.classes:
             try:
-                class_assignments = await self._scrape_class_assignments(page, cls)
+                class_assignments = self._scrape_class_assignments(cls)
                 self.assignments.extend(class_assignments)
                 logger.info(
                     "Found %d items for '%s'",
-                    len(class_assignments), cls.name
+                    len(class_assignments), cls.name,
                 )
             except Exception as e:
                 logger.error("Error scraping class '%s': %s", cls.name, e)
 
         return self.classes, self.assignments
 
-    async def _scrape_class_list(self, page: Page) -> list[ClassInfo]:
+    # ─── Class list ─────────────────────────────────────────────────────
+
+    def _scrape_class_list(self) -> list[ClassInfo]:
         """Scrape the list of classes from the Google Classroom homepage.
 
         Google Classroom renders many ``<a href="/c/…">`` links per class
@@ -98,21 +120,17 @@ class GoogleClassroomScraper:
 
             "G\\nGLE - Learning Strategies D\\n109/209/309/409"
 
-        where the first line is a single-letter icon and the *second* line is
-        the real class name.  Card-header links typically omit the icon letter.
-
         We group all links by their course ID (from the URL) and pick the
         best text for each unique course.
         """
-        # ── Collect every /c/ link ──
-        links = await page.locator('a[href*="/c/"]').all()
+        links = self.driver.find_elements(By.CSS_SELECTOR, 'a[href*="/c/"]')
 
         # Map courseId → list of (full_url, raw_text)
         course_texts: dict[str, list[tuple[str, str]]] = {}
         for link in links:
             try:
-                href = await link.get_attribute("href") or ""
-                text = (await link.inner_text()).strip()
+                href = link.get_attribute("href") or ""
+                text = link.text.strip()
                 if not text or "/c/" not in href:
                     continue
                 # Normalise URL
@@ -127,19 +145,17 @@ class GoogleClassroomScraper:
             except Exception as e:
                 logger.debug("Error reading class link: %s", e)
 
-        # ── Pick the best (longest) text per course and extract name ──
+        # Pick the best (longest) text per course and extract name
         classes = []
         for cid, entries in course_texts.items():
-            # Sort by text length descending — longer text has more info
             entries.sort(key=lambda e: len(e[1]), reverse=True)
             best_url, best_text = entries[0]
-            # Strip the URL down to the class page (no /sp/… suffix)
             class_url = re.sub(r"/sp/.+$", "", best_url)
 
             # Parse name: skip any single-char first line (icon letter)
             lines = [ln.strip() for ln in best_text.split("\n") if ln.strip()]
             if len(lines) >= 2 and len(lines[0]) <= 2:
-                name = lines[1]  # second line is the real class name
+                name = lines[1]
                 section = lines[2] if len(lines) > 2 else ""
             else:
                 name = lines[0] if lines else cid
@@ -149,27 +165,28 @@ class GoogleClassroomScraper:
                 name=name,
                 platform=Platform.GOOGLE_CLASSROOM,
                 url=class_url,
-                teacher=section,  # section code in "teacher" field for display
+                teacher=section,
                 short_code=_get_short_code(name, self.semester_classes),
             ))
 
-        # Fallback: try to get classes from the page content
+        # Fallback
         if not classes:
-            classes = await self._scrape_class_list_fallback(page)
+            classes = self._scrape_class_list_fallback()
 
         return classes
 
-    async def _scrape_class_list_fallback(self, page: Page) -> list[ClassInfo]:
+    def _scrape_class_list_fallback(self) -> list[ClassInfo]:
         """Fallback class list scraping using broader selectors."""
         classes = []
         try:
-            # Try getting all major clickable elements that look like courses
-            # Google Classroom uses various selectors across versions
-            all_links = await page.locator('a[data-courseid], a[href*="classroom.google.com/c/"]').all()
+            all_links = self.driver.find_elements(
+                By.CSS_SELECTOR,
+                'a[data-courseid], a[href*="classroom.google.com/c/"]',
+            )
             for link in all_links:
                 try:
-                    href = await link.get_attribute("href") or ""
-                    text = (await link.inner_text()).strip()
+                    href = link.get_attribute("href") or ""
+                    text = link.text.strip()
                     if text:
                         classes.append(ClassInfo(
                             name=text.split("\n")[0].strip(),
@@ -185,8 +202,7 @@ class GoogleClassroomScraper:
         # Ultimate fallback: parse page HTML
         if not classes:
             try:
-                content = await page.content()
-                # Look for course links in HTML
+                content = self.driver.page_source
                 course_pattern = r'href="(/c/[^"]+)"[^>]*>([^<]+)'
                 matches = re.findall(course_pattern, content)
                 for href, name in matches:
@@ -203,71 +219,72 @@ class GoogleClassroomScraper:
 
         return classes
 
-    async def _scrape_class_assignments(
-        self, page: Page, cls: ClassInfo
-    ) -> list[Assignment]:
+    # ─── Per-class assignments ──────────────────────────────────────────
+
+    def _scrape_class_assignments(self, cls: ClassInfo) -> list[Assignment]:
         """Scrape assignments for a specific class."""
         assignments: list[Assignment] = []
 
-        # Navigate to the class page
-        await page.goto(cls.url, wait_until="load", timeout=30000)
-        await page.wait_for_timeout(2000)
+        self.driver.get(cls.url)
+        self._wait_for_load()
+        time.sleep(2)
 
-        # The Classwork tab already uses data-stream-item-id containers
-        # which capture assignments, quizzes, etc.
-        classwork_assignments = await self._scrape_classwork_tab(page, cls)
+        classwork_assignments = self._scrape_classwork_tab(cls)
         if classwork_assignments:
             assignments.extend(classwork_assignments)
 
         return assignments
 
-    async def _scrape_classwork_tab(
-        self, page: Page, cls: ClassInfo
-    ) -> list[Assignment]:
-        """Scrape the Classwork tab for assignments.
-
-        Google Classroom's classwork page wraps each item in a
-        ``<div data-stream-item-id="…">`` container.  Inside:
-
-        * ``<a aria-label='Assignment: "Planning Log"' …>`` — type + title
-        * ``<div class="JvYRu …">`` — "Teacher posted … : Title"
-        * ``<div class="MXd8B …">`` — "Due Feb 12" (may be absent)
-        """
+    def _scrape_classwork_tab(self, cls: ClassInfo) -> list[Assignment]:
+        """Scrape the Classwork tab for assignments."""
         assignments: list[Assignment] = []
 
         # Click on "Classwork" tab
         try:
-            classwork_tab = page.locator(
-                'a:has-text("Classwork"), '
-                'a[aria-label*="Classwork"], '
-                'a[href*="/cw/"], '
-                'a[data-tab-id="5"]'
-            )
-            if await classwork_tab.count() > 0:
-                await classwork_tab.first.click()
-                await page.wait_for_load_state("load", timeout=15000)
-                await page.wait_for_timeout(2000)
+            tab = None
+            # Try CSS selectors first
+            for sel in [
+                'a[aria-label*="Classwork"]',
+                'a[href*="/cw/"]',
+                'a[data-tab-id="5"]',
+            ]:
+                elements = self.driver.find_elements(By.CSS_SELECTOR, sel)
+                if elements:
+                    tab = elements[0]
+                    break
+
+            # Try text-based match
+            if not tab:
+                elements = self.driver.find_elements(
+                    By.XPATH, '//a[contains(., "Classwork")]'
+                )
+                if elements:
+                    tab = elements[0]
+
+            if tab:
+                tab.click()
+                self._wait_for_load(timeout=15)
+                time.sleep(2)
             else:
                 class_id = cls.url.rstrip("/").split("/")[-1]
-                await page.goto(
-                    f"{self.BASE_URL}/c/{class_id}/a/not-turned-in/all",
-                    wait_until="load", timeout=30000,
+                self.driver.get(
+                    f"{self.BASE_URL}/c/{class_id}/a/not-turned-in/all"
                 )
-                await page.wait_for_timeout(2000)
+                self._wait_for_load()
+                time.sleep(2)
         except Exception as e:
             logger.debug("Could not navigate to Classwork for '%s': %s", cls.name, e)
             return assignments
 
-        # ── Parse items using data-stream-item-id containers ──
-        # Use [data-stream-item-type] to avoid matching nested child divs
-        # that also carry data-stream-item-id but not data-stream-item-type.
+        # Parse items using data-stream-item-id containers
         try:
-            containers = await page.locator(
-                "div[data-stream-item-id][data-stream-item-type]"
-            ).all()
+            containers = self.driver.find_elements(
+                By.CSS_SELECTOR,
+                "div[data-stream-item-id][data-stream-item-type]",
+            )
             for container in containers:
                 try:
-                    assignment = await self._parse_stream_item(container, cls)
+                    assignment = self._parse_stream_item(container, cls)
                     if assignment:
                         assignments.append(assignment)
                 except Exception as e:
@@ -277,23 +294,22 @@ class GoogleClassroomScraper:
 
         # Fallback: parse raw HTML
         if not assignments:
-            assignments = await self._parse_classwork_html(page, cls)
+            assignments = self._parse_classwork_html(cls)
 
         return assignments
 
-    async def _parse_stream_item(
-        self, container, cls: ClassInfo
+    def _parse_stream_item(
+        self, container: WebElement, cls: ClassInfo
     ) -> Optional[Assignment]:
         """Parse a ``div[data-stream-item-id]`` element from the Classwork tab."""
-        # 1. Extract title + type from <a aria-label="…">
         title = ""
         item_type = ItemType.ASSIGNMENT
-        link = container.locator("a[aria-label]")
         href = ""
-        if await link.count() > 0:
-            aria = (await link.first.get_attribute("aria-label")) or ""
-            href = (await link.first.get_attribute("href")) or ""
-            # aria-label looks like: 'Assignment: "Planning Log"'
+
+        links = container.find_elements(By.CSS_SELECTOR, "a[aria-label]")
+        if links:
+            aria = links[0].get_attribute("aria-label") or ""
+            href = links[0].get_attribute("href") or ""
             m = re.match(r'(Assignment|Quiz|Material|Question):\s*"(.+)"', aria)
             if m:
                 kind, title = m.group(1), m.group(2)
@@ -303,12 +319,13 @@ class GoogleClassroomScraper:
                 elif "material" in kind_lower:
                     item_type = ItemType.MATERIAL
 
-        # 2. Fallback: description line "Teacher posted … : Title"
+        # Fallback: description line "Teacher posted … : Title"
         if not title:
-            desc_loc = container.locator(".JvYRu, .qoXqmb")
-            if await desc_loc.count() > 0:
-                desc_text = (await desc_loc.first.inner_text()).strip()
-                # "Rachel Kaufman posted a new assignment: Planning Log"
+            desc_elements = container.find_elements(
+                By.CSS_SELECTOR, ".JvYRu, .qoXqmb"
+            )
+            if desc_elements:
+                desc_text = desc_elements[0].text.strip()
                 colon_idx = desc_text.rfind(":")
                 if colon_idx != -1:
                     title = desc_text[colon_idx + 1:].strip()
@@ -316,14 +333,14 @@ class GoogleClassroomScraper:
                     title = desc_text
 
         if not title:
-            return None  # skip items with no extractable title
+            return None
 
-        # 3. Due date from ".MXd8B" div
+        # Due date from ".MXd8B" div
         due_date = None
         due_date_str = ""
-        due_loc = container.locator(".MXd8B")
-        if await due_loc.count() > 0:
-            raw = (await due_loc.first.inner_text()).strip()
+        due_elements = container.find_elements(By.CSS_SELECTOR, ".MXd8B")
+        if due_elements:
+            raw = due_elements[0].text.strip()
             due_date_str = raw
             m = re.search(r"(?:due|Due)\s+(.+)", raw, re.IGNORECASE)
             if m:
@@ -332,8 +349,8 @@ class GoogleClassroomScraper:
                 except Exception:
                     pass
 
-        # 4. Determine status from surrounding text
-        full_text = (await container.inner_text()).strip().lower()
+        # Determine status from surrounding text
+        full_text = container.text.strip().lower()
         status = AssignmentStatus.ASSIGNED
         if "missing" in full_text:
             status = AssignmentStatus.MISSING
@@ -357,18 +374,13 @@ class GoogleClassroomScraper:
             url=url,
         )
 
-    async def _parse_classwork_html(
-        self, page: Page, cls: ClassInfo
-    ) -> list[Assignment]:
+    def _parse_classwork_html(self, cls: ClassInfo) -> list[Assignment]:
         """Parse classwork from raw HTML as a fallback."""
         assignments = []
         try:
-            content = await page.content()
-            # Look for assignment-like elements
-            # Google Classroom embeds assignment data in specific patterns
+            content = self.driver.page_source
             assignment_pattern = r'href="(/c/[^/]+/(?:a|sa)/[^"]+)"[^>]*>([^<]+)'
             matches = re.findall(assignment_pattern, content)
-
             for href, title in matches:
                 title = title.strip()
                 if title and len(title) > 2:
@@ -381,29 +393,20 @@ class GoogleClassroomScraper:
                     ))
         except Exception as e:
             logger.debug("HTML classwork parsing failed: %s", e)
-
         return assignments
 
-    # _scrape_stream and _scrape_todo_page removed — classwork tab covers all items
+    # ─── Global To-do ───────────────────────────────────────────────────
 
-    async def scrape_global_todo(self) -> list[Assignment]:
-        """Scrape the global To-do page for all incomplete assignments.
-
-        The page shows ``data-stream-item-id`` containers just like the
-        classwork tab **unless** the student has nothing outstanding, in
-        which case the body contains 'Nothing on your to-do list'.
-        """
+    def scrape_global_todo(self) -> list[Assignment]:
+        """Scrape the global To-do page for all incomplete assignments."""
         items: list[Assignment] = []
-        page = self.context.pages[0] if self.context.pages else await self.context.new_page()
 
         try:
-            await page.goto(
-                f"{self.BASE_URL}/u/0/a/not-turned-in/all",
-                wait_until="load", timeout=30000,
-            )
-            await page.wait_for_timeout(3000)
+            self.driver.get(f"{self.BASE_URL}/u/0/a/not-turned-in/all")
+            self._wait_for_load()
+            time.sleep(3)
 
-            body_text = await page.inner_text("body")
+            body_text = self.driver.find_element(By.TAG_NAME, "body").text
             if "nothing on your to-do list" in body_text.lower():
                 logger.info("Global to-do page is empty — no outstanding work.")
                 return items
@@ -411,26 +414,26 @@ class GoogleClassroomScraper:
             logger.info("Global to-do page loaded, parsing items...")
 
             # Prefer structured containers
-            containers = await page.locator("div[data-stream-item-id]").all()
+            containers = self.driver.find_elements(
+                By.CSS_SELECTOR, "div[data-stream-item-id]"
+            )
             if containers:
                 for container in containers:
                     try:
-                        # Reuse the same parser; create a pseudo ClassInfo
-                        # with course name extracted from the item text.
-                        a = await self._parse_global_todo_item(container)
+                        a = self._parse_global_todo_item(container)
                         if a:
                             items.append(a)
                     except Exception as e:
                         logger.debug("Error parsing global stream item: %s", e)
             else:
-                # Fallback: look for detail links only (not nav links)
-                detail_links = await page.locator(
-                    'a[href*="/details"]'
-                ).all()
+                # Fallback: look for detail links only
+                detail_links = self.driver.find_elements(
+                    By.CSS_SELECTOR, 'a[href*="/details"]'
+                )
                 for link in detail_links:
                     try:
-                        aria = (await link.get_attribute("aria-label")) or ""
-                        href = (await link.get_attribute("href")) or ""
+                        aria = link.get_attribute("aria-label") or ""
+                        href_val = link.get_attribute("href") or ""
                         m = re.match(
                             r'(Assignment|Quiz|Material|Question):\s*"(.+)"',
                             aria,
@@ -438,8 +441,8 @@ class GoogleClassroomScraper:
                         if m:
                             title = m.group(2)
                             url = (
-                                href if href.startswith("http")
-                                else f"{self.BASE_URL}{href}"
+                                href_val if href_val.startswith("http")
+                                else f"{self.BASE_URL}{href_val}"
                             )
                             items.append(Assignment(
                                 title=title,
@@ -456,16 +459,18 @@ class GoogleClassroomScraper:
 
         return items
 
-    async def _parse_global_todo_item(self, container) -> Optional[Assignment]:
+    def _parse_global_todo_item(
+        self, container: WebElement
+    ) -> Optional[Assignment]:
         """Parse a single item on the global to-do page."""
         title = ""
         item_type = ItemType.ASSIGNMENT
         href = ""
 
-        link = container.locator("a[aria-label]")
-        if await link.count() > 0:
-            aria = (await link.first.get_attribute("aria-label")) or ""
-            href = (await link.first.get_attribute("href")) or ""
+        links = container.find_elements(By.CSS_SELECTOR, "a[aria-label]")
+        if links:
+            aria = links[0].get_attribute("aria-label") or ""
+            href = links[0].get_attribute("href") or ""
             m = re.match(r'(Assignment|Quiz|Material|Question):\s*"(.+)"', aria)
             if m:
                 kind, title = m.group(1), m.group(2)
@@ -475,9 +480,11 @@ class GoogleClassroomScraper:
                     item_type = ItemType.MATERIAL
 
         if not title:
-            desc_loc = container.locator(".JvYRu, .qoXqmb")
-            if await desc_loc.count() > 0:
-                desc_text = (await desc_loc.first.inner_text()).strip()
+            desc_elements = container.find_elements(
+                By.CSS_SELECTOR, ".JvYRu, .qoXqmb"
+            )
+            if desc_elements:
+                desc_text = desc_elements[0].text.strip()
                 colon_idx = desc_text.rfind(":")
                 title = desc_text[colon_idx + 1:].strip() if colon_idx != -1 else desc_text
 
@@ -486,7 +493,7 @@ class GoogleClassroomScraper:
 
         # Course name — sometimes in a secondary line
         course_name = "Unknown Class"
-        full_text = (await container.inner_text()).strip()
+        full_text = container.text.strip()
         for code in self.semester_classes:
             if code.upper() in full_text.upper():
                 course_name = code
@@ -495,9 +502,9 @@ class GoogleClassroomScraper:
         # Due date
         due_date = None
         due_date_str = ""
-        due_loc = container.locator(".MXd8B")
-        if await due_loc.count() > 0:
-            raw = (await due_loc.first.inner_text()).strip()
+        due_elements = container.find_elements(By.CSS_SELECTOR, ".MXd8B")
+        if due_elements:
+            raw = due_elements[0].text.strip()
             due_date_str = raw
             m = re.search(r"(?:due|Due)\s+(.+)", raw, re.IGNORECASE)
             if m:
