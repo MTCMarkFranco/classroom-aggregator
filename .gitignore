@@ -21,6 +21,9 @@ env/
 # Debug screenshots
 debug_screenshots/
 
+# Reports output
+reports/
+
 # Playwright
 playwright-report/
 test-results/

@@ -80,3 +80,53 @@ If credentials aren't set in `.env` or via flags, you'll be prompted interactive
 - The tool uses Playwright to automate a real Chrome browser because neither Google Classroom nor TDSB's Brightspace instance offer student API access.
 - On first run with `HEADLESS=false`, you can watch the login flow to verify it works correctly.
 - The `SEMESTER_CLASSES` filter uses case-insensitive substring matching — `ENG` matches "ENG3U1 - English" etc.
+
+## Running on a Raspberry Pi
+
+You can run this project headless on a Raspberry Pi and have it generate a report once a day.
+
+### Quick Setup
+
+1. Copy the entire project folder to the Pi (USB drive, `scp`, `rsync`, etc.):
+   ```bash
+   scp -r classroom-aggregator/ pi@<PI_IP>:~/classroom-aggregator/
+   ```
+
+2. SSH into the Pi and run the setup script:
+   ```bash
+   ssh pi@<PI_IP>
+   cd ~/classroom-aggregator
+   bash pi_setup.sh
+   ```
+
+   This installs all dependencies, sets up a Python venv with Playwright Chromium,
+   and creates a cron job that runs daily at **7:00 AM**.
+
+3. Make sure `.env` exists on the Pi with your credentials (it isn't committed to git):
+   ```bash
+   nano ~/classroom-aggregator/.env
+   ```
+
+### Changing the Schedule
+
+Override the time when running setup, or edit cron afterwards:
+
+```bash
+# Run at 6:30 AM instead
+CRON_HOUR=6 CRON_MINUTE=30 bash pi_setup.sh
+
+# Or edit cron directly
+crontab -e
+```
+
+### Reports
+
+Reports are saved to `reports/`:
+- `latest_report.txt` — most recent run
+- `report_YYYY-MM-DD_HHMM.txt` — dated copies (auto-pruned after 14 days)
+- `latest_run.log` — stderr/debug log from the last run
+
+Run manually at any time:
+```bash
+bash ~/classroom-aggregator/run_daily.sh
+```
