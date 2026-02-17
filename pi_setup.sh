@@ -34,13 +34,13 @@ echo ""
 
 # ── 1. System packages ─────────────────────────────────────
 echo "[1/5] Installing system packages..."
-sudo apt-get update -qq
-sudo apt-get install -y -qq \
+sudo apt-get update
+sudo apt-get install -y \
     git \
     python3 \
     python3-venv \
     python3-pip \
-    curl 2>/dev/null
+    curl
 echo "   ✓ System packages installed"
 
 # ── 2. Python virtual environment ──────────────────────────
