@@ -32,16 +32,16 @@ echo "Project directory : $PROJECT_DIR"
 echo "Cron schedule     : ${CRON_MINUTE} ${CRON_HOUR} * * *  (daily)"
 echo ""
 
-# ── 1. System packages ─────────────────────────────────────
-echo "[1/5] Installing system packages..."
-sudo apt-get update
-sudo apt-get install -y \
-    git \
-    python3 \
-    python3-venv \
-    python3-pip \
-    curl
-echo "   ✓ System packages installed"
+# # ── 1. System packages ─────────────────────────────────────
+# echo "[1/5] Installing system packages..."
+# sudo apt-get update
+# sudo apt-get install -y \
+#     git \
+#     python3 \
+#     python3-venv \
+#     python3-pip \
+#     curl
+# echo "   ✓ System packages installed"
 
 # ── 2. Python virtual environment ──────────────────────────
 echo "[2/5] Setting up Python virtual environment..."
