@@ -1,14 +1,15 @@
 #!/bin/bash
 # ============================================================
-# Raspberry Pi Setup Script — Classroom Assignment Aggregator
+# Ubuntu Setup Script — Classroom Assignment Aggregator
 # ============================================================
-# Copy this entire project folder to the Pi (via USB, SCP, etc.)
-# then run:   bash pi_setup.sh
+# Tested on: Ubuntu Desktop LTS (aarch64 / Raspberry Pi 4)
+#
+# Clone the repo then run:   bash pi_setup.sh
 #
 # It will:
-#   1. Install system dependencies (Python 3, Chromium libs)
+#   1. Install system dependencies (git, Python 3, etc.)
 #   2. Create a Python virtual environment
-#   3. Install Python packages + Playwright Chromium
+#   3. Install Python packages + Playwright Chromium (with deps)
 #   4. Set up a daily cron job (default: 7:00 AM)
 #   5. Create a convenience wrapper to run manually
 # ============================================================
@@ -24,7 +25,7 @@ OUTPUT_DIR="$PROJECT_DIR/reports"
 RUN_SCRIPT="$PROJECT_DIR/run_daily.sh"
 
 echo "============================================"
-echo "  Classroom Aggregator — Raspberry Pi Setup"
+echo "  Classroom Aggregator — Ubuntu Setup"
 echo "============================================"
 echo ""
 echo "Project directory : $PROJECT_DIR"
@@ -35,46 +36,12 @@ echo ""
 echo "[1/5] Installing system packages..."
 sudo apt-get update -qq
 sudo apt-get install -y -qq \
+    git \
     python3 \
     python3-venv \
     python3-pip \
-    libglib2.0-0 \
-    libnss3 \
-    libnspr4 \
-    libdbus-1-3 \
-    libatk1.0-0 \
-    libatk-bridge2.0-0 \
-    libcups2 \
-    libdrm2 \
-    libxkbcommon0 \
-    libatspi2.0-0 \
-    libxcomposite1 \
-    libxdamage1 \
-    libxfixes3 \
-    libxrandr2 \
-    libgbm1 \
-    libpango-1.0-0 \
-    libcairo2 \
-    libasound2 \
-    libx11-xcb1 \
-    curl \
-    gnupg 2>/dev/null
+    curl 2>/dev/null
 echo "   ✓ System packages installed"
-
-# Install latest Google Chrome
-if ! command -v google-chrome-stable &>/dev/null; then
-    echo "   Installing Google Chrome..."
-    curl -fsSL https://dl.google.com/linux/linux_signing_key.pub \
-        | sudo gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/google-chrome.gpg] \
-https://dl.google.com/linux/chrome/deb/ stable main" \
-        | sudo tee /etc/apt/sources.list.d/google-chrome.list >/dev/null
-    sudo apt-get update -qq
-    sudo apt-get install -y -qq google-chrome-stable
-    echo "   ✓ Google Chrome installed ($(google-chrome-stable --version))"
-else
-    echo "   ✓ Google Chrome already installed ($(google-chrome-stable --version))"
-fi
 
 # ── 2. Python virtual environment ──────────────────────────
 echo "[2/5] Setting up Python virtual environment..."
@@ -94,9 +61,9 @@ pip install --upgrade pip -q
 pip install -r "$PROJECT_DIR/requirements.txt" -q
 echo "   ✓ Python packages installed"
 
-echo "   Installing Playwright Chromium browser..."
-playwright install chromium 2>&1 | tail -1
-echo "   ✓ Playwright Chromium installed"
+echo "   Installing Playwright Chromium browser + OS dependencies..."
+playwright install --with-deps chromium 2>&1 | tail -5
+echo "   ✓ Playwright Chromium installed (with system dependencies)"
 
 # ── 4. Create the daily runner script ──────────────────────
 echo "[4/5] Creating daily runner script..."
