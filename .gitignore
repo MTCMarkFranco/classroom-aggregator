@@ -34,5 +34,4 @@ Desktop.ini
 .DS_Store
 
 # Secrets / credentials
-*.env
 .env
