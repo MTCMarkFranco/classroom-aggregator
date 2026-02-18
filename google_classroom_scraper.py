@@ -60,17 +60,17 @@ class GoogleClassroomScraper:
         page = self.context.pages[0] if self.context.pages else await self.context.new_page()
 
         # Navigate to class list
-        await page.goto(f"{self.BASE_URL}/h", wait_until="networkidle", timeout=60000)
+        await page.goto(f"{self.BASE_URL}/h", wait_until="domcontentloaded", timeout=30000)
 
-        # Wait for at least one class card link to appear in the DOM
+        # Wait for at least one class card link to be rendered by JS
         try:
-            await page.wait_for_selector('a[href*="/c/"]', state="attached", timeout=30000)
+            await page.wait_for_selector('a[href*="/c/"]', state="visible", timeout=30000)
             logger.info("Class card links detected in DOM")
         except Exception:
             logger.warning("Timed out waiting for class card links — proceeding anyway")
 
-        # Extra pause for any remaining JS rendering
-        await page.wait_for_timeout(3000)
+        # Let remaining cards finish rendering
+        await page.wait_for_timeout(5000)
 
         # Get all classes
         all_classes = await self._scrape_class_list(page)
