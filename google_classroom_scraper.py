@@ -174,12 +174,21 @@ class GoogleClassroomScraper:
             for url, txt in entries:
                 print(f"    [raw] cid={cid}  text={txt!r:.80}")
 
-        # ── Pick the best (longest) text per course and extract name ──
+        # ── Pick the best text per course and extract name ──
+        # Prefer links that point to the class page itself (/c/<id>)
+        # rather than assignment sub-links (/c/<id>/a/… or /c/<id>/p/…).
         classes = []
         for cid, entries in course_texts.items():
-            # Sort by text length descending — longer text has more info
-            entries.sort(key=lambda e: len(e[1]), reverse=True)
-            best_url, best_text = entries[0]
+            # Separate class-level links from assignment/sub-links
+            class_links = [
+                (url, txt) for url, txt in entries
+                if re.fullmatch(rf".*?/c/{re.escape(cid)}/?(\?.*)?$", url)
+                or re.fullmatch(rf".*?/c/{re.escape(cid)}/sp/?(\?.*)?$", url)
+            ]
+            # Among class-level links, pick the longest text
+            pool = class_links if class_links else entries
+            pool.sort(key=lambda e: len(e[1]), reverse=True)
+            best_url, best_text = pool[0]
             # Strip the URL down to the class page (no /sp/… suffix)
             class_url = re.sub(r"/sp/.+$", "", best_url)
 
