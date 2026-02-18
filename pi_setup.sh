@@ -9,7 +9,7 @@
 # It will:
 #   1. Install system dependencies (git, Python 3, etc.)
 #   2. Create a Python virtual environment
-#   3. Install Python packages + Playwright Chromium (with deps)
+#   3. Install Python packages + Playwright Firefox (with deps)
 #   4. Set up a daily cron job (default: 7:00 AM)
 #   5. Create a convenience wrapper to run manually
 # ============================================================
@@ -61,9 +61,9 @@ pip install --upgrade pip -q
 pip install -r "$PROJECT_DIR/requirements.txt" -q
 echo "   ✓ Python packages installed"
 
-echo "   Installing Playwright Chromium browser + OS dependencies..."
-playwright install --with-deps chromium 2>&1 | tail -5
-echo "   ✓ Playwright Chromium installed (with system dependencies)"
+echo "   Installing Playwright Firefox browser + OS dependencies..."
+playwright install --with-deps firefox 2>&1 | tail -5
+echo "   ✓ Playwright Firefox installed (with system dependencies)"
 
 # ── 4. Create the daily runner script ──────────────────────
 echo "[4/5] Creating daily runner script..."

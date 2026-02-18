@@ -44,29 +44,12 @@ class TDSBAuth:
         self._bs_context: BrowserContext | None = None
 
     async def start_browser(self, headless: bool = False):
-        """Launch the browser using the locally-installed Chrome."""
+        """Launch the Firefox browser via Playwright."""
         self._playwright = await async_playwright().start()
-        try:
-            # Use the user's installed Chrome so the version is always current
-            self._browser = await self._playwright.chromium.launch(
-                channel="chrome",
-                headless=headless,
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--no-sandbox",
-                ],
-            )
-            logger.info("Launched installed Chrome (headless=%s)", headless)
-        except Exception:
-            # Fall back to Playwright's bundled Chromium if Chrome isn't installed
-            self._browser = await self._playwright.chromium.launch(
-                headless=headless,
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--no-sandbox",
-                ],
-            )
-            logger.info("Launched bundled Chromium (headless=%s)", headless)
+        self._browser = await self._playwright.firefox.launch(
+            headless=headless,
+        )
+        logger.info("Launched Firefox (headless=%s)", headless)
         if self.debug:
             os.makedirs(SCREENSHOT_DIR, exist_ok=True)
 
