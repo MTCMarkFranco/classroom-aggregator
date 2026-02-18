@@ -63,13 +63,20 @@ class GoogleClassroomScraper:
         await page.goto(f"{self.BASE_URL}/h", wait_until="load", timeout=30000)
         await page.wait_for_timeout(3000)
 
+        # Scroll down to ensure lazy-loaded class cards are rendered
+        await self._scroll_to_load_all(page)
+
         # Get all classes
         all_classes = await self._scrape_class_list(page)
         logger.info("Found %d total classes on Google Classroom", len(all_classes))
+        for c in all_classes:
+            logger.info("  Discovered class: '%s'  (url=%s)", c.name, c.url)
 
         # Filter to semester classes
         self.classes = [c for c in all_classes if _matches_semester_class(c.name, self.semester_classes)]
         logger.info("Matched %d semester classes on Google Classroom", len(self.classes))
+        for c in self.classes:
+            logger.info("  Matched class: '%s'", c.name)
 
         # If no filtered matches, use all classes (user can filter later)
         if not self.classes:
@@ -89,6 +96,19 @@ class GoogleClassroomScraper:
                 logger.error("Error scraping class '%s': %s", cls.name, e)
 
         return self.classes, self.assignments
+
+    async def _scroll_to_load_all(self, page: Page, max_scrolls: int = 10):
+        """Scroll the page to the bottom to trigger lazy-loaded content."""
+        for _ in range(max_scrolls):
+            previous_height = await page.evaluate("document.body.scrollHeight")
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            await page.wait_for_timeout(1000)
+            new_height = await page.evaluate("document.body.scrollHeight")
+            if new_height == previous_height:
+                break
+        # Scroll back to top
+        await page.evaluate("window.scrollTo(0, 0)")
+        await page.wait_for_timeout(500)
 
     async def _scrape_class_list(self, page: Page) -> list[ClassInfo]:
         """Scrape the list of classes from the Google Classroom homepage.

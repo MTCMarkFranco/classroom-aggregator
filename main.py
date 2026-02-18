@@ -330,9 +330,12 @@ async def run(
                     pass
 
             all_assignments.extend(gc_assignments)
+            class_names = ", ".join(c.name for c in gc_classes) or "(none)"
             console.print(
-                f"[green]✓ Found {len(gc_classes)} classes, "
-                f"{len(gc_assignments)} items on Google Classroom[/green]"
+                f"[green]✓ Found {len(gc_classes)} classes: {class_names}[/green]"
+            )
+            console.print(
+                f"[green]  {len(gc_assignments)} items on Google Classroom[/green]"
             )
 
         except Exception as e:
