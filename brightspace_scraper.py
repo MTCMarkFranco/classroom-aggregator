@@ -69,6 +69,19 @@ class BrightspaceScraper:
         except Exception:
             pass
 
+    async def _scroll_to_load_all(self, page: Page, max_scrolls: int = 10):
+        """Scroll the page to the bottom to trigger lazy-loaded content."""
+        for _ in range(max_scrolls):
+            previous_height = await page.evaluate("document.body.scrollHeight")
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            await page.wait_for_timeout(1500)
+            new_height = await page.evaluate("document.body.scrollHeight")
+            if new_height == previous_height:
+                break
+        # Scroll back to top
+        await page.evaluate("window.scrollTo(0, 0)")
+        await page.wait_for_timeout(500)
+
     async def scrape_all(self) -> tuple[list[ClassInfo], list[Assignment]]:
         """Main entry: scrape classes then assignments for each."""
         page = self.context.pages[0] if self.context.pages else await self.context.new_page()
@@ -79,6 +92,9 @@ class BrightspaceScraper:
 
         # Dismiss "Your browser is looking a little retro" dialog if present
         await self._dismiss_browser_warning(page)
+
+        # Scroll down to load any lazy-loaded course tiles
+        await self._scroll_to_load_all(page)
 
         # Get classes
         all_classes = await self._scrape_class_list(page)

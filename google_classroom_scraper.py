@@ -8,6 +8,7 @@ to interact with it.
 
 import asyncio
 import logging
+import os
 import re
 from datetime import datetime
 from typing import Optional
@@ -19,6 +20,9 @@ from models import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Directory to save debug screenshots
+SCREENSHOT_DIR = os.path.join(os.path.dirname(__file__), "debug_screenshots")
 
 # Default semester classes (overridden by .env / constructor arg)
 DEFAULT_SEMESTER_CLASSES = ["ENG", "GLE", "PPL", "History"]
@@ -72,17 +76,26 @@ class GoogleClassroomScraper:
         # Let remaining cards finish rendering
         await page.wait_for_timeout(5000)
 
+        # Always save a screenshot of the class list page for diagnostics
+        os.makedirs(SCREENSHOT_DIR, exist_ok=True)
+        try:
+            ss_path = os.path.join(SCREENSHOT_DIR, "gc_class_list.png")
+            await page.screenshot(path=ss_path, full_page=True)
+            print(f"  [debug] Screenshot saved: {ss_path}")
+        except Exception as e:
+            print(f"  [debug] Screenshot failed: {e}")
+
         # Get all classes
         all_classes = await self._scrape_class_list(page)
-        logger.info("Found %d total classes on Google Classroom", len(all_classes))
+        print(f"  [debug] Found {len(all_classes)} total classes on Google Classroom:")
         for c in all_classes:
-            logger.info("  Discovered class: '%s'  (url=%s)", c.name, c.url)
+            print(f"    - '{c.name}'  (url={c.url})")
 
         # Filter to semester classes
         self.classes = [c for c in all_classes if _matches_semester_class(c.name, self.semester_classes)]
-        logger.info("Matched %d semester classes on Google Classroom", len(self.classes))
+        print(f"  [debug] Matched {len(self.classes)} semester classes (filter={self.semester_classes}):")
         for c in self.classes:
-            logger.info("  Matched class: '%s'", c.name)
+            print(f"    - '{c.name}'")
 
         # If no filtered matches, use all classes (user can filter later)
         if not self.classes:
@@ -138,7 +151,10 @@ class GoogleClassroomScraper:
         for link in links:
             try:
                 href = await link.get_attribute("href") or ""
+                # Try inner_text first, fall back to textContent
                 text = (await link.inner_text()).strip()
+                if not text:
+                    text = (await link.text_content() or "").strip()
                 if not text or "/c/" not in href:
                     continue
                 # Normalise URL
@@ -152,6 +168,11 @@ class GoogleClassroomScraper:
                 course_texts.setdefault(cid, []).append((href, text))
             except Exception as e:
                 logger.debug("Error reading class link: %s", e)
+
+        # Debug: dump all raw course texts
+        for cid, entries in course_texts.items():
+            for url, txt in entries:
+                print(f"    [raw] cid={cid}  text={txt!r:.80}")
 
         # ── Pick the best (longest) text per course and extract name ──
         classes = []
